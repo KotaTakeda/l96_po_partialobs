@@ -4,3 +4,4 @@ jupyter
 matplotlib
 seaborn
 tqdm
+git+https://github.com/KotaTakeda/da_py.git@v0.4.5
