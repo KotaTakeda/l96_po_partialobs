@@ -10,4 +10,4 @@ pip install -r requirements.txt
 
 
 # TODO:
-- fixbb width for all figures
+- fix width for all figures
