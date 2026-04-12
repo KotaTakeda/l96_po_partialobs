@@ -11,7 +11,7 @@ from da.etkf import ETKF
 from da.po import PO
 import visualize
 
-plt.rcParams['text.usetex'] = False
+plt.rcParams["text.usetex"] = False
 
 
 def loss_sq(X, Y):
@@ -35,33 +35,33 @@ def main():
     # Parameter Configurations
     # ==========================================
     # System Parameters
-    J = 60          # dim of state space
-    F = 8           # forcing
-    dt = 0.01       # time step size
-    N0 = 20 * 360   # number of spin-up time steps
-    N = 20 * 50     # number of simulation time steps
+    J = 60  # dim of state space
+    F = 8  # forcing
+    dt = 0.01  # time step size
+    N0 = 20 * 360  # number of spin-up time steps
+    N = 20 * 50  # number of simulation time steps
 
     # Observation Parameters
-    obs_per = 1     # observation interval in steps
-    r = 1.0         # observation noise std
+    obs_per = 1  # observation interval in steps
+    r = 1.0  # observation noise std
 
     # Data Assimilation Parameters
-    m = 10          # ensemble size
-    num_seeds = 20   # number of random seeds for simulation & plotting
+    m = 10  # ensemble size
+    num_seeds = 20  # number of random seeds for simulation & plotting
     seed_list = np.arange(num_seeds)
     alpha_list = [0.0, 0.5, 2.0, 10.0, 100.0]  # multiplicative inflation factors
     methods = ["po_add", "po_proj"]  # DA methods
 
     # Visualization / Evaluation Parameters
-    method = "po_add"          # default DA method to plot
-    per_vis = 20               # plotting frequency
+    method = "po_add"  # default DA method to plot
+    per_vis = 20  # plotting frequency
     per_ticklabel = per_vis * 20  # plot ticks parameter
-    N_end = 50                 # plot until N_end steps in SE plot
-    i_seed = 0                 # seed index for spatio-temporal plots
+    N_end = 50  # plot until N_end steps in SE plot
+    i_seed = 0  # seed index for spatio-temporal plots
     alpha_list_vis_st = [0.0, 0.5, 2.0]  # alpha list for spatio-temporal plots
-    k_ens = 0                  # ensemble index for spatio-temporal plots
-    n_start = 0                # start step for spatio-temporal plots
-    n_end = N                  # end step for spatio-temporal plots
+    k_ens = 0  # ensemble index for spatio-temporal plots
+    n_start = 0  # start step for spatio-temporal plots
+    n_end = N  # end step for spatio-temporal plots
 
     # ==========================================
     # Generate the true trajectory
@@ -94,9 +94,9 @@ def main():
     t = np.arange(N) * dt
     fig3, ax3 = plt.subplots()
     ax3.grid(False)
-    ax3.set_title('norm after spin-up')
-    ax3.set_xlabel('$t$')
-    ax3.set_ylabel('$ |u|/\\sqrt{J}$')
+    ax3.set_title("norm after spin-up")
+    ax3.set_xlabel("$t$")
+    ax3.set_ylabel("$ |u|/\\sqrt{J}$")
     ax3.set_ylim([0.0, 8.5])
     ax3.plot(t, norm, lw=0.5)
     fig3.tight_layout()
@@ -122,7 +122,7 @@ def main():
     print("diag of H:", H_diag)
     print("rank(H):", Ny)
 
-    R = r ** 2 * np.eye(J)
+    R = r**2 * np.eye(J)
     R = H @ R @ H.T
     print("obs noise std:", r)
 
@@ -147,10 +147,14 @@ def main():
             for j, seed in enumerate(seed_list):
                 np.random.seed(seed)
                 y = (H @ x_true.T).T
-                y += np.random.multivariate_normal(mean=np.zeros_like(y[0]), cov=R, size=len(y))
+                y += np.random.multivariate_normal(
+                    mean=np.zeros_like(y[0]), cov=R, size=len(y)
+                )
                 Y[j] = y[:]
 
-                X_0 = x_true[np.random.randint(len(x_true))] + np.random.multivariate_normal(
+                X_0 = x_true[
+                    np.random.randint(len(x_true))
+                ] + np.random.multivariate_normal(
                     mean=np.zeros_like(x_true[0]), cov=P0, size=m
                 )
 
@@ -193,7 +197,7 @@ def main():
             np.save(f"{data_dir}/y-seeds({len(seed_list)})", Y)
 
     # ==========================================
-    # Plot errors and minimum eigenvalues
+    # Plot errors and off-diagonal ratio
     # ==========================================
     from visualize import get_linestyle_cycle, get_marker_cycle
 
@@ -205,7 +209,7 @@ def main():
     fig2, ax2 = plt.subplots(figsize=(7, 4))
 
     num_alpha = len(alpha_list)
-    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
     time_ticks = np.arange(Nt // per_vis) * per_vis + 1
     time_ticklabels = np.arange(Nt // per_ticklabel + 1) * per_ticklabel
@@ -229,11 +233,13 @@ def main():
             ls = next(line_cycle)
             marker = next(marker_cycle)
 
-            se_wtm = loss_sq(x_true[None, :, None, :] - xa, 0) + loss_sq(x_true[None, :, None, :] @ H.T - xa @ H.T, 0)
+            se_wtm = loss_sq(x_true[None, :, None, :] - xa, 0) + loss_sq(
+                x_true[None, :, None, :] @ H.T - xa @ H.T, 0
+            )
             se_tm, _ = stats(se_wtm)
             se_t = se_tm.mean(axis=1)
             se_wt = se_wtm.mean(axis=2)
-            print("t-averaged SE", se_tm[Nt // 2:].mean())
+            print("t-averaged SE", se_tm[Nt // 2 :].mean())
 
             ax1.plot(
                 time_ticks[:N_end],
@@ -246,7 +252,13 @@ def main():
                 ms=5,
             )
             for se_k in se_wt:
-                ax1.plot(time_ticks[:N_end], se_k[::per_vis][:N_end], lw=0.25, color=color, alpha=0.3)
+                ax1.plot(
+                    time_ticks[:N_end],
+                    se_k[::per_vis][:N_end],
+                    lw=0.25,
+                    color=color,
+                    alpha=0.3,
+                )
 
             Pi = H.T @ H
             Q = np.eye(J) - Pi
@@ -254,24 +266,41 @@ def main():
             P = (dX.swapaxes(-2, -1) @ dX) / (m - 1)
             QPHt = Q @ P @ Pi.T
             HPHt = Pi @ P @ Pi.T
-            rf = (np.linalg.norm(QPHt, axis=(2, 3)) / np.linalg.norm(HPHt, axis=(2, 3))).mean(axis=0)
-            ax2.plot(time_ticks[:N_end], rf[::per_vis][:N_end], label=f"{method_name.replace('po_', '')} $\\alpha$={alpha}", lw=0.5, ls=ls, color=color, marker=marker, ms=5)
+            rf = (
+                np.linalg.norm(QPHt, axis=(2, 3)) / np.linalg.norm(HPHt, axis=(2, 3))
+            ).mean(axis=0)
+            ax2.plot(
+                time_ticks[:N_end],
+                rf[::per_vis][:N_end],
+                label=f"{method_name.replace('po_', '')} $\\alpha$={alpha}",
+                lw=0.5,
+                ls=ls,
+                color=color,
+                marker=marker,
+                ms=5,
+            )
 
-    ax1.plot(time_ticks[:N_end], 4 * Ny * (r**2) * np.ones_like(time_ticks[:N_end]), label='$ 4 N_y r^2 $', lw=0.5, c='black')
+    ax1.plot(
+        time_ticks[:N_end],
+        4 * Ny * (r**2) * np.ones_like(time_ticks[:N_end]),
+        label="$ 4 N_y r^2 $",
+        lw=0.5,
+        c="black",
+    )
 
     ax1.set_xlabel("observation time step")
     ax1.set_title("The time series of $\\mathrm{MSE}$")
     ax1.set_ylabel(r"$ \frac{1}{m} \sum_{k=1}^m \mathbb{E} \|\delta^{(k)}\|^2 $")
     ax1.set_yscale("log")
     fig1.tight_layout()
-    ax1.legend(bbox_to_anchor=(1.0, 1.0), loc='upper right')
+    ax1.legend(bbox_to_anchor=(1.0, 1.0), loc="upper right")
     fig1.tight_layout()
 
     ax2.set_title("The off-diagonal ratio in the covariance")
     ax2.set_ylabel(r"$\|QP\Pi\|_F / \|\Pi P \Pi\|_F$")
     ax2.set_xlabel("observation time step")
     ax2.set_ylim([0.0, 2.0])
-    ax2.legend(bbox_to_anchor=(1.0, 1.0), loc='upper right')
+    ax2.legend(bbox_to_anchor=(1.0, 1.0), loc="upper right")
     fig2.tight_layout()
 
     fig1.savefig(f"{data_dir}/l96-po-inflation_Pse.pdf", transparent=True)
@@ -289,8 +318,12 @@ def main():
     vmax = 1.0
     vmin = -1.0
 
-    fig1, axes1 = plt.subplots(num_methods, num_alphas, figsize=(4 * num_alphas, 4 * num_methods))
-    fig2, axes2 = plt.subplots(num_methods, num_alphas, figsize=(4 * num_alphas, 4 * num_methods))
+    fig1, axes1 = plt.subplots(
+        num_methods, num_alphas, figsize=(8, 8 * num_methods / num_alphas)
+    )
+    fig2, axes2 = plt.subplots(
+        num_methods, num_alphas, figsize=(8, 8 * num_methods / num_alphas)
+    )
 
     if num_methods == 1 and num_alphas == 1:
         axes1 = np.array([[axes1]])
@@ -313,33 +346,52 @@ def main():
             P_last /= P_last.max()
 
             ax1 = axes1[r_idx, c]
-            im1 = ax1.imshow(P_last, cmap="coolwarm", interpolation="none", vmax=vmax, vmin=vmin)
-            ax1.set_title(f"{method_name}, $\\alpha$={alpha}")
+            im1 = ax1.imshow(
+                P_last, cmap="coolwarm", interpolation="none", vmax=vmax, vmin=vmin
+            )
+            if r_idx == 0:
+                ax1.set_title(f"$\\alpha$={alpha}")
+            if c == 0:
+                ax1.set_ylabel(method_name + "\n" + "i")
+            if r_idx == num_methods - 1:
+                ax1.set_xlabel("j")
             ax1.set_xticks([])
             ax1.set_yticks([])
-            if c == len(alpha_list) - 1:
-                fig1.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 
             P_rearranged = P_last[sort_idx][:, sort_idx]
             ax2 = axes2[r_idx, c]
-            im2 = ax2.imshow(P_rearranged, cmap="coolwarm", interpolation="none", vmax=vmax, vmin=vmin)
-            ax2.set_title(f"{method_name}, $\\alpha$={alpha}")
+            im2 = ax2.imshow(
+                P_rearranged,
+                cmap="coolwarm",
+                interpolation="none",
+                vmax=vmax,
+                vmin=vmin,
+            )
+            if r_idx == 0:
+                ax2.set_title(f"$\\alpha$={alpha}")
+            if c == 0:
+                ax2.set_ylabel(method_name + "\n" + "i")
+            if r_idx == num_methods - 1:
+                ax2.set_xlabel("j")
             ax2.set_xticks([])
             ax2.set_yticks([])
-            if c == len(alpha_list) - 1:
-                fig2.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
 
-    fig1.suptitle("Normalized Last Covariance $P_n/\\max(P_{i,j})$ (Original)")
-    fig1.tight_layout()
-    fig2.suptitle("Normalized Last Covariance $P_n/\\max(P_{i,j})$ (Rearranged: Observed first, Unobserved last)")
-    fig2.tight_layout()
-    plt.show()
+    # fig1.suptitle("Normalized Last Covariance $P_n/\\max(P_{i,j})$ (Original)")
+    fig1.colorbar(im1, ax=axes1.ravel().tolist(), fraction=0.046, pad=0.04)
+    # fig1.tight_layout(rect=[0, 0, 0.95, 1])
+    # fig2.suptitle(
+    #     "Normalized Last Covariance $P_n/\\max(P_{i,j})$ (Rearranged: Observed first, Unobserved last)"
+    # )
+    fig2.colorbar(im2, ax=axes2.ravel().tolist(), fraction=0.046, pad=0.04)
+    # fig2.tight_layout(rect=[0, 0, 0.95, 1])
+    # plt.show()
 
     fig2.savefig(f"{data_dir}/normalized_last_covariance")
 
     # ==========================================
-    # Spatio-temporal Plot
+    # Spatio-temporal Plot: State, Observations, Assimilations
     # ==========================================
+    print("Spatio-temporal Plot: State, Observations, Assimilations")
     x_true = np.load(f"{data_dir}/x_true_l96_full.npy")
     Y = np.load(f"{data_dir}/y-seeds({num_seeds}).npy")
     y = Y[i_seed]
@@ -356,23 +408,44 @@ def main():
     vmin = np.min(x1)
 
     fig1, ax1 = plt.subplots(1, 2, figsize=(8, 4))
-    im1 = ax1[0].imshow(x1, aspect=J / (n_end - n_start), vmax=vmax, vmin=vmin, origin="lower", interpolation="none")
+    im1 = ax1[0].imshow(
+        x1,
+        aspect=J / (n_end - n_start),
+        vmax=vmax,
+        vmin=vmin,
+        origin="lower",
+        interpolation="none",
+    )
     ax1[0].set_ylabel("obs steps $n$")
     ax1[0].set_xlabel("space $i$")
     ax1[0].set_title("x_true")
 
-    ax1[1].imshow(x2, aspect=J / (n_end - n_start), vmax=vmax, vmin=vmin, origin="lower", interpolation="none")
+    ax1[1].imshow(
+        x2,
+        aspect=J / (n_end - n_start),
+        vmax=vmax,
+        vmin=vmin,
+        origin="lower",
+        interpolation="none",
+    )
     ax1[1].set_xlabel("space $i$")
     ax1[1].set_title("y_obs")
     ax1[1].set_yticks([])
 
     cax1 = fig1.add_axes([0.92, 0.155, 0.03, 0.675])
     fig1.colorbar(im1, cax=cax1)
-    fig1.suptitle(f"True State & Observations: from t={n_start} to t={n_end}", fontsize=16)
+    fig1.suptitle(
+        f"True State & Observations: from t={n_start} to t={n_end}", fontsize=16
+    )
     fig1.savefig(f"{data_dir}/spatio_temporal_true_obs")
-    plt.show()
+    # plt.show()
 
-    fig2, axes2 = plt.subplots(num_methods, num_alphas, figsize=(8, 8 * num_methods / num_alphas))
+    fig2, axes2 = plt.subplots(
+        num_methods,
+        num_alphas,
+        figsize=(8, 8 * num_methods / num_alphas),
+        gridspec_kw={"hspace": 0.3, "wspace": 0.05},
+    )
     if num_methods == 1 and num_alphas == 1:
         axes2 = np.array([[axes2]])
     elif num_methods == 1:
@@ -388,7 +461,14 @@ def main():
             x3 = x_assim[n_start:n_end]
 
             ax = axes2[r_idx, a_idx]
-            im2 = ax.imshow(x3, aspect=J / (n_end - n_start), vmax=vmax, vmin=vmin, origin="lower", interpolation="none")
+            im2 = ax.imshow(
+                x3,
+                aspect=J / (n_end - n_start),
+                vmax=vmax,
+                vmin=vmin,
+                origin="lower",
+                interpolation="none",
+            )
             if r_idx == 0:
                 ax.set_title(f"$\\alpha$={alpha_val}")
                 ax.set_xticks([])
@@ -398,13 +478,89 @@ def main():
                 ax.set_ylabel(m_name + "\n" + "$n$")
             else:
                 ax.set_yticks([])
-            if a_idx == num_alphas - 1:
-                fig2.colorbar(im2, ax=ax, fraction=0.046, pad=0.04)
 
-    fig2.suptitle(f"Spatio-temporal Assimilations: from t={n_start} to t={n_end}", fontsize=16)
-    fig2.tight_layout()
+    fig2.suptitle(
+        f"Spatio-temporal Assimilations: from t={n_start} to t={n_end}", fontsize=16
+    )
+    fig2.colorbar(im2, ax=axes2.ravel().tolist(), fraction=0.046, pad=0.04)
+    # fig2.tight_layout(rect=[0, 0, 0.95, 1])
     fig2.savefig(f"{data_dir}/spatio_temporal_assimilations")
-    plt.show()
+    # plt.show()
+
+    # ==========================================
+    # Spatio-temporal Plot: Absolute Errors
+    # ==========================================
+    print("Spatio-temporal Plot: Absolute Errors")
+
+    # load data
+    x_true = np.load(f"{data_dir}/x_true_l96_full.npy")
+    x_t = x_true[n_start:n_end]
+
+    num_methods = len(methods)
+    num_alphas = len(alpha_list_vis_st)
+
+    # print
+    print("methods:", methods)
+    print("alphas:", alpha_list_vis_st)
+
+    # Pass 1: compute global maximum absolute error for consistent vmax
+    global_vmax = 0.0
+    for m_name in methods:
+        paramname = f"m({m})-{m_name}-alpha({'='.join([str(alpha) for alpha in alpha_list])})-seeds({len(seed_list)})"
+        Xa = np.load(f"{data_dir}/xa-{paramname}.npy")
+        for a_idx in range(num_alphas):
+            x_assim = Xa[a_idx, i_seed].mean(axis=1)
+            e_assim = np.abs(x_assim[n_start:n_end] - x_t)
+            global_vmax = max(global_vmax, np.max(e_assim))
+
+    vmin = 0.0
+    vmax = max(0.0, global_vmax)  # ensure vmax >= vmin
+
+    fig, axes = plt.subplots(
+        num_methods,
+        num_alphas,
+        figsize=(8, 8 * num_methods / num_alphas),
+        gridspec_kw={"hspace": 0.3, "wspace": 0.05},
+    )
+    if num_methods == 1 and num_alphas == 1:
+        axes = np.array([[axes]])
+    elif num_methods == 1:
+        axes = axes[np.newaxis, :]
+    elif num_alphas == 1:
+        axes = axes[:, np.newaxis]
+
+    for r_idx, m_name in enumerate(methods):
+        paramname = f"m({m})-{m_name}-alpha({'='.join([str(alpha) for alpha in alpha_list])})-seeds({len(seed_list)})"
+        Xa = np.load(f"{data_dir}/xa-{paramname}.npy")
+        for a_idx, alpha_val in enumerate(alpha_list_vis_st):
+            x_assim = Xa[a_idx, i_seed, :, k_ens]
+            e_assim = np.abs(x_assim[n_start:n_end] - x_t)
+
+            ax = axes[r_idx, a_idx]
+            im = ax.imshow(
+                e_assim,
+                aspect=J / (n_end - n_start),
+                vmax=vmax,
+                vmin=vmin,
+                origin="lower",
+                interpolation="none",
+                cmap="flare_r",
+            )
+            if r_idx == 0:
+                ax.set_title(f"$\\alpha$={alpha_val}")
+                ax.set_xticks([])
+            elif r_idx == num_methods - 1:
+                ax.set_xlabel("$i$")
+            if a_idx == 0:
+                ax.set_ylabel(m_name + "\n" + "$n$", fontsize=14)
+            else:
+                ax.set_yticks([])
+    fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.046, pad=0.04)
+
+    fig.suptitle(f"Absolute Errors: from n={n_start} to n={n_end}", fontsize=16)
+    # fig.tight_layout()
+    fig.savefig(f"{data_dir}/absolute_errors_all")
+    # plt.show()
 
 
 if __name__ == "__main__":
