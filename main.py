@@ -543,7 +543,7 @@ def main():
             if a_idx == 0:
                 ax.set_ylabel(display_method(m_name) + "\n" + "$n$")
                 if r_idx == num_methods - 1:
-                    ax.set_ylabel("time $n$")
+                    ax.set_ylabel(display_method(m_name) + "\n" + "time $n$")
             else:
                 ax.set_yticks([])
 
@@ -616,9 +616,9 @@ def main():
                 if a_idx == 0:
                     ax.set_xlabel("space $i$")
             if a_idx == 0:
-                ax.set_ylabel(display_method(m_name) + "\n" + "$n$", fontsize=14)
-                if r_idx == 0:
-                    ax.set_ylabel("time $n$")
+                ax.set_ylabel(display_method(m_name) + "\n" + "$n$")
+                if r_idx == num_methods - 1:
+                    ax.set_ylabel(display_method(m_name) + "\n" + "time $n$")
             else:
                 ax.set_yticks([])
 
