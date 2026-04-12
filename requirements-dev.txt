@@ -1,0 +1,2 @@
+# Development-only dependency: ruff linter/formatter
+ruff>=0.0.300
