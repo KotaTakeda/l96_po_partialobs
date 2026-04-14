@@ -4,7 +4,7 @@
 This file factors paramname construction and data loading into helper functions and
 separates plotting into an error-plot loop and an off-diagonal-ratio loop.
 """
-
+import os
 import matplotlib.pyplot as plt
 import numpy as np
 from da.etkf import ETKF
@@ -75,6 +75,7 @@ def stats(X):
 
 def main():
     data_dir = "data/20260412v1"
+    os.makedirs(data_dir, exist_ok=True) # make data directory if not exists
 
     # ------------------------------------------
     # Parameters
@@ -333,13 +334,14 @@ def main():
 
             Pi = H.T @ H
             Q = np.eye(J) - Pi
-            dX = xa - xa.mean(axis=2, keepdims=True)
-            P = (dX.swapaxes(-2, -1) @ dX) / (m - 1)
+            xa = xa[i_seed] # (Nt, m, J)
+            dX = xa - xa.mean(axis=1, keepdims=True) # (Nt, J)
+            P = (dX.swapaxes(-2, -1) @ dX) / (m - 1) # (J, J)
             QPHt = Q @ P @ Pi.T
             HPHt = Pi @ P @ Pi.T
             rf = (
-                np.linalg.norm(QPHt, axis=(2, 3)) / np.linalg.norm(HPHt, axis=(2, 3))
-            ).mean(axis=0)
+                np.linalg.norm(QPHt, axis=(1, 2)) / np.linalg.norm(HPHt, axis=(1, 2))
+            )
 
             ax2.plot(
                 time_ticks[:N_end],
@@ -353,7 +355,7 @@ def main():
             )
 
     # ax2.set_title("The off-diagonal ratio in the covariance")
-    ax2.set_ylabel(r"$\left|(I-\Pi)P\Pi\right|_F / \left|\Pi P \Pi\right|_F$")
+    ax2.set_ylabel(r"$\left|(I-\Pi)P_n\Pi\right|_F / \left|\Pi P_n \Pi\right|_F$")
     ax2.set_xlabel("time step $n$")
     ax2.set_ylim((0.0, 2.0))
     ax2.legend(bbox_to_anchor=(1.0, 1.0), loc="upper right", ncol=2)
