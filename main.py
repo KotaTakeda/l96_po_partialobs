@@ -1,224 +1,234 @@
 #!/usr/bin/env python3
-"""Run the Lorenz96 DA experiment with helper functions for paramname and data loading.
+"""Reproduce the Lorenz 96 PO experiments reported in the manuscript.
 
-This file factors paramname construction and data loading into helper functions and
-separates plotting into an error-plot loop and an off-diagonal-ratio loop.
+The script runs the perturbed-observation (PO) filter with additive inflation
+(`po_add`) and projected additive inflation (`po_proj`) for the partially
+observed Lorenz 96 model, then saves the data products and figures used in the
+paper.
 """
-import os
+
+import argparse
+import json
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
-from da.etkf import ETKF
 from da.l96 import lorenz96
 from da.po import PO
 from da.scheme import rk4
 
-import visualize  # provides get_linestyle_cycle, get_marker_cycle
+import visualize
 
 plt.rcParams["text.usetex"] = False
 
 
-def display_method(m):
-    """Return a human-friendly display name for DA methods."""
-    if m == "po_add":
+def display_method(method_name):
+    """Return the label used in the manuscript figures."""
+    if method_name == "po_add":
         return "add"
-    if m == "po_proj":
+    if method_name == "po_proj":
         return "add-proj"
-    return m.replace("po_", "")
+    return method_name.replace("po_", "")
 
 
-def make_paramname(m, method_name, alpha_list, seed_list_len):
-    """Construct the paramname string used in file names.
-
-    Example:
-        m(10)-po_add-alpha(0.0=0.5=2.0)-seeds(20)
-    """
-    alpha_part = "=".join([str(alpha) for alpha in alpha_list])
-    return f"m({m})-{method_name}-alpha({alpha_part})-seeds({seed_list_len})"
+def true_trajectory_path(data_dir):
+    """Return the canonical cache path for the true trajectory."""
+    return data_dir / "true_trajectory.npy"
 
 
-def try_load_xa(data_dir, paramname):
-    """Try to load the xa file for a given paramname. Return ndarray or None."""
-    path = f"{data_dir}/xa-{paramname}.npy"
-    try:
-        xa = np.load(path)
-        print("Xa loaded:", path, xa.shape)
-        return xa
-    except Exception:
-        return None
+def observations_path(data_dir):
+    """Return the canonical cache path for observations."""
+    return data_dir / "observations.npy"
 
 
-def load_xa(data_dir, paramname):
-    """Load xa file and raise if missing (prints shape)."""
-    path = f"{data_dir}/xa-{paramname}.npy"
-    xa = np.load(path)
-    print("Xa loaded:", path, xa.shape)
-    return xa
+def analysis_ensembles_path(data_dir, method_name):
+    """Return the canonical cache path for analysis ensembles."""
+    return data_dir / method_name / "analysis_ensembles.npy"
 
 
-def load_y(data_dir, num_seeds):
-    """Load observations saved as y-seeds(NUM).npy."""
-    path = f"{data_dir}/y-seeds({num_seeds}).npy"
-    y = np.load(path)
-    print("Y loaded:", path, y.shape)
-    return y
+def parameters_path(data_dir):
+    """Return the canonical path for run metadata."""
+    return data_dir / "run_parameters.json"
 
 
-def loss_sq(X, Y):
-    """Squared difference summed over last axis. X, Y: (..., Nt, J) or broadcastable."""
-    return np.sum((X - Y) ** 2, axis=-1)
+def load_npy(path):
+    """Load an ``.npy`` file and print its shape for traceability."""
+    array = np.load(path)
+    print("loaded:", path, array.shape)
+    return array
 
 
-def stats(X):
-    """Return mean and std across first axis. X shape: (N_seed, Nt, ...)."""
-    return X.mean(axis=0), X.std(axis=0)
+def maybe_load_npy(path):
+    """Load an ``.npy`` file if it exists."""
+    if path.exists():
+        return load_npy(path)
+    return None
 
 
-def main():
-    data_dir = "data/20260412v1"
-    os.makedirs(data_dir, exist_ok=True) # make data directory if not exists
+def save_run_parameters(data_dir, parameters):
+    """Save experiment parameters as JSON."""
+    path = parameters_path(data_dir)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(parameters, f, indent=2)
+        f.write("\n")
+    print("saved:", path)
 
-    # ------------------------------------------
-    # Parameters
-    # ------------------------------------------
-    # System
-    J = 60
-    F = 8
-    dt = 0.01
-    N0 = 20 * 360
-    N = 20 * 50
 
-    # Observation
-    obs_per = 1
-    r = 1.0
+def loss_sq(x, y):
+    """Squared Euclidean loss summed over the state dimension."""
+    return np.sum((x - y) ** 2, axis=-1)
 
-    # DA
-    m = 10
-    num_seeds = 20
-    seed_list = np.arange(num_seeds)
-    alpha_list = [0.0, 0.5, 2.0, 10.0, 100.0]
-    methods = ["po_add", "po_proj"]
 
-    # Visualization / eval
-    per_vis = 20
-    per_ticklabel = per_vis * 20
-    N_end = 50
-    i_seed = 0
-    alpha_list_vis_st = [0.0, 0.5, 2.0]
-    k_ens = 0
-    n_start = 0
-    n_end = N
+def stats(x):
+    """Return mean and std over the first axis."""
+    return x.mean(axis=0), x.std(axis=0)
 
-    # ------------------------------------------
-    # True trajectory (generate or load)
-    # ------------------------------------------
-    x0 = F * np.ones(J)
-    x0[19] *= 1.001
+
+def build_observation_operator(state_dim):
+    """Return the partial observation operator from Definition 2.1."""
+    h_diag = np.ones(state_dim)
+    h_diag[2::3] = 0
+    h = np.diag(h_diag)
+    return h[h_diag != 0]
+
+
+def generate_true_trajectory(data_dir, x0, forcing, dt, spinup_steps, num_steps):
+    """Load or generate the true Lorenz 96 trajectory after spin-up."""
+    path = true_trajectory_path(data_dir)
+    x_true = maybe_load_npy(path)
+    if x_true is not None:
+        return x_true
+
     scheme = rk4
-    p = (F,)
+    params = (forcing,)
+    result = np.zeros((spinup_steps + num_steps, len(x0)))
+    x = x0.copy()
+    result[0] = x
+    for n in range(1, spinup_steps + num_steps):
+        x = scheme(lorenz96, n * dt, x, params, dt)
+        result[n] = x
 
-    try:
-        x_true_full = np.load(f"{data_dir}/x_true_l96_full.npy")
-        print("x_true loaded:", x_true_full.shape)
-    except Exception:
-        result = np.zeros((N0 + N, J))
-        x = x0.copy()
-        result[0] = x[:]
-        for n in range(1, N0 + N):
-            t = n * dt
-            x = scheme(lorenz96, t, x, p, dt)
-            result[n] = x[:]
-        x_true_full = result[N0:]
-        print("x_true generated:", x_true_full.shape)
-        np.save(f"{data_dir}/x_true_l96_full", x_true_full)
+    x_true = result[spinup_steps:]
+    np.save(path, x_true)
+    print("generated:", path, x_true.shape)
+    return x_true
 
-    # normalized energy plot (after spin-up)
-    norm = np.linalg.norm(x_true_full, axis=-1) / np.sqrt(J)
-    tvec = np.arange(N) * dt
-    fig3, ax3 = plt.subplots()
-    ax3.grid(False)
-    ax3.set_title("norm after spin-up")
-    ax3.set_xlabel("$t$")
-    ax3.set_ylabel("$ |u|/\\sqrt{J}$")
-    ax3.set_ylim((0.0, 8.5))
-    ax3.plot(tvec, norm, lw=0.5)
-    fig3.tight_layout()
 
-    # ------------------------------------------
-    # DA setting
-    # ------------------------------------------
-    print("obs_per", obs_per, "steps")
-    Dt = dt * obs_per
+def generate_observations_and_initial_ensembles(x_true, h, r, ensemble_size, seed_list):
+    """Generate observations and initial ensembles for each seed.
 
-    def M(x, Dt_inner):
+    The initial ensemble follows the manuscript description: choose
+    ``ensemble_size`` points from the attractor and perturb each by Gaussian
+    noise with covariance ``16 I``.
+    """
+    obs_dim = h.shape[0]
+    state_dim = x_true.shape[1]
+    observation_cov = (r**2) * np.eye(obs_dim)
+    initial_cov = (4**2) * np.eye(state_dim)
+
+    observations = np.zeros((len(seed_list), len(x_true), obs_dim))
+    initial_ensembles = np.zeros((len(seed_list), ensemble_size, state_dim))
+    projected_truth = (h @ x_true.T).T
+
+    for j, seed in enumerate(seed_list):
+        rng = np.random.RandomState(int(seed))
+        observations[j] = projected_truth + rng.multivariate_normal(
+            mean=np.zeros(obs_dim),
+            cov=observation_cov,
+            size=len(x_true),
+        )
+
+        attractor_index = rng.randint(len(x_true))
+        initial_ensembles[j] = x_true[attractor_index] + rng.multivariate_normal(
+            mean=np.zeros(state_dim),
+            cov=initial_cov,
+            size=ensemble_size,
+        )
+
+    return observations, initial_ensembles
+
+
+def run_assimilation(
+    data_dir,
+    x_true,
+    h,
+    forcing,
+    r,
+    dt,
+    obs_per,
+    ensemble_size,
+    alpha_list,
+    methods,
+    seed_list,
+    recompute=False,
+):
+    """Run the PO experiments and cache analysis ensembles and observations."""
+    y_path = observations_path(data_dir)
+    obs_dim = h.shape[0]
+    state_dim = x_true.shape[1]
+    observation_cov = (r**2) * np.eye(obs_dim)
+    observations = None
+    initial_ensembles = None
+
+    if not recompute:
+        observations = maybe_load_npy(y_path)
+
+    if observations is None:
+        observations, initial_ensembles = generate_observations_and_initial_ensembles(
+            x_true=x_true,
+            h=h,
+            r=r,
+            ensemble_size=ensemble_size,
+            seed_list=seed_list,
+        )
+        np.save(y_path, observations)
+        print("saved:", y_path, observations.shape)
+
+    if initial_ensembles is None:
+        _, initial_ensembles = generate_observations_and_initial_ensembles(
+            x_true=x_true,
+            h=h,
+            r=r,
+            ensemble_size=ensemble_size,
+            seed_list=seed_list,
+        )
+
+    dt_obs = dt * obs_per
+    params = (forcing,)
+
+    def model_step(x, _dt_obs):
         for _ in range(obs_per):
-            x = rk4(lorenz96, 0, x, p, dt)
+            x = rk4(lorenz96, 0.0, x, params, dt)
         return x
 
-    H_diag = np.ones(J)
-    H_diag[2::3] = 0
-    H = np.diag(H_diag)
-    H = H[H_diag != 0]
-
-    Ny = np.linalg.matrix_rank(H)
-    print("H.shape:", H.shape)
-    print("diag of H:", H_diag)
-    print("rank(H):", Ny)
-
-    R = r**2 * np.eye(J)
-    R = H @ R @ H.T
-    print("obs noise std:", r)
-
-    Nt = N
-    x_true = x_true_full[:Nt:obs_per]
-
-    print("ensemble size m:", m)
-    P0 = 4**2 * np.eye(J)
-
-    # ------------------------------------------
-    # Run DA (compute & save Xa, Y)
-    # ------------------------------------------
+    xa_dict = {}
     for method_name in methods:
-        print("method:", method_name)
-        paramname = make_paramname(m, method_name, alpha_list, len(seed_list))
-        Xa = try_load_xa(data_dir, paramname)
-        if Xa is None:
-            Xa = np.zeros((len(alpha_list), len(seed_list), Nt, m, J))
-            Y = np.zeros((len(seed_list), Nt, H.shape[0]))
+        xa_path = analysis_ensembles_path(data_dir=data_dir, method_name=method_name)
+        xa_path.parent.mkdir(parents=True, exist_ok=True)
+        xa = None if recompute else maybe_load_npy(xa_path)
+        if xa is None:
+            xa = np.zeros(
+                (len(alpha_list), len(seed_list), len(x_true), ensemble_size, state_dim)
+            )
             for j, seed in enumerate(seed_list):
-                np.random.seed(int(seed))
-                # observations with noise
-                y = (H @ x_true.T).T
-                y += np.random.multivariate_normal(
-                    mean=np.zeros_like(y[0]), cov=R, size=len(y)
-                )
-                Y[j] = y[:]
-
-                # initial ensemble
-                X_0 = x_true[
-                    np.random.randint(len(x_true))
-                ] + np.random.multivariate_normal(
-                    mean=np.zeros_like(x_true[0]), cov=P0, size=m
-                )
-
+                y = observations[j]
+                x0_ensemble = initial_ensembles[j]
                 for i, alpha in enumerate(alpha_list):
-                    print(" alpha:", alpha)
                     np.random.seed(int(seed))
-                    if method_name == "etkf":
-                        da_instance = ETKF(M, H, R, alpha=alpha**2, store_ensemble=True)
-                    elif method_name == "po_add":
+                    if method_name == "po_add":
                         da_instance = PO(
-                            M,
-                            H,
-                            R,
+                            model_step,
+                            h,
+                            observation_cov,
                             alpha=alpha**2,
                             store_ensemble=True,
                             additive_inflation=True,
                         )
                     elif method_name == "po_proj":
                         da_instance = PO(
-                            M,
-                            H,
-                            R,
+                            model_step,
+                            h,
+                            observation_cov,
                             alpha=alpha**2,
                             store_ensemble=True,
                             additive_inflation=True,
@@ -227,61 +237,62 @@ def main():
                     else:
                         raise ValueError(f"Unknown method: {method_name}")
 
-                    da_instance.initialize(X_0)
+                    da_instance.initialize(x0_ensemble.copy())
                     for y_obs in y:
-                        da_instance.forecast(Dt)
+                        da_instance.forecast(dt_obs)
                         da_instance.update(y_obs)
+                    xa[i, j] = da_instance.Xa
 
-                    Xa[i, j] = da_instance.Xa
+            np.save(xa_path, xa)
+            print("saved:", xa_path, xa.shape)
 
-            np.save(f"{data_dir}/xa-{paramname}", Xa)
-            np.save(f"{data_dir}/y-seeds({len(seed_list)})", Y)
+        xa_dict[method_name] = xa
 
-    # ------------------------------------------
-    # Plotting: separate loops
-    #   - Loop A: error plots (fig1 / ax1)
-    #   - Loop B: off-diagonal ratio plots (fig2 / ax2)
-    # ------------------------------------------
-    get_linestyle_cycle = visualize.get_linestyle_cycle
-    get_marker_cycle = visualize.get_marker_cycle
+    return observations, xa_dict
 
-    print(f"Visualize until {per_vis * N_end} steps")
-    print("methods:", methods)
 
-    # Error plot (MSE time series)
-    fig1, ax1 = plt.subplots(figsize=(7, 4))
+def plot_fig1_mse(
+    data_dir,
+    x_true,
+    h,
+    r,
+    alpha_list_all,
+    alpha_list_fig,
+    methods,
+    xa_dict,
+    per_vis=20,
+    num_points=50,
+):
+    """Plot Figure 1: MSE time series."""
+    fig, ax = plt.subplots(figsize=(7, 4))
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    time_ticks = np.arange(Nt // per_vis) * per_vis + 1
+    time_ticks = np.arange(len(x_true) // per_vis) * per_vis + 1
+    ny = np.linalg.matrix_rank(h)
+    alpha_index_map = {alpha: alpha_list_all.index(alpha) for alpha in alpha_list_fig}
 
     for k, method_name in enumerate(methods):
-        paramname = make_paramname(m, method_name, alpha_list, len(seed_list))
-        print(" loading param for errors:", paramname)
-        Xa = load_xa(data_dir, paramname)
-
+        xa = xa_dict[method_name]
         color = colors[k % len(colors)]
-        line_cycle = get_linestyle_cycle()
-        marker_cycle = get_marker_cycle()
+        line_cycle = visualize.get_linestyle_cycle()
+        marker_cycle = visualize.get_marker_cycle()
 
-        for i, xa in enumerate(Xa):
-            alpha = alpha_list[i]
-            if i in [3, 4]:
-                print(" skip alpha (errors):", alpha)
-                continue
-
+        for alpha in alpha_list_fig:
+            alpha_idx = alpha_index_map[alpha]
+            xa_alpha = xa[alpha_idx]
             ls = next(line_cycle)
             marker = next(marker_cycle)
 
-            se_wtm = loss_sq(x_true[None, :, None, :] - xa, 0) + loss_sq(
-                x_true[None, :, None, :] @ H.T - xa @ H.T, 0
+            delta_sq = loss_sq(x_true[None, :, None, :] - xa_alpha, 0.0) + loss_sq(
+                x_true[None, :, None, :] @ h.T - xa_alpha @ h.T,
+                0.0,
             )
-            se_tm, _ = stats(se_wtm)
-            se_t = se_tm.mean(axis=1)
-            se_wt = se_wtm.mean(axis=2)
-            print(" t-averaged SE (errors)", se_tm[Nt // 2 :].mean())
+            delta_mean_t, _ = stats(delta_sq)
+            delta_mean = delta_mean_t.mean(axis=1)
+            delta_mean_per_seed = delta_sq.mean(axis=2)
 
-            ax1.plot(
-                time_ticks[:N_end],
-                se_t[::per_vis][:N_end],
+            ax.plot(
+                time_ticks[:num_points],
+                delta_mean[::per_vis][:num_points],
                 label=f"{display_method(method_name)} $\\alpha$={alpha}",
                 lw=0.5,
                 ls=ls,
@@ -289,295 +300,54 @@ def main():
                 marker=marker,
                 ms=5,
             )
-            for se_k in se_wt:
-                ax1.plot(
-                    time_ticks[:N_end],
-                    se_k[::per_vis][:N_end],
+            for delta_seed in delta_mean_per_seed:
+                ax.plot(
+                    time_ticks[:num_points],
+                    delta_seed[::per_vis][:num_points],
                     lw=0.25,
                     color=color,
                     alpha=0.3,
                 )
 
-    # theoretical bound line
-    ax1.plot(
-        time_ticks[:N_end],
-        4 * Ny * (r**2) * np.ones_like(time_ticks[:N_end]),
+    ax.plot(
+        time_ticks[:num_points],
+        4 * ny * (r**2) * np.ones_like(time_ticks[:num_points]),
         label="$ 4 N_y r^2 $",
         lw=0.5,
         c="black",
     )
+    ax.set_xlabel("time step $n$")
+    ax.set_ylabel(r"$ \frac{1}{m} \sum_{k=1}^m \mathbb{E} \|\delta^{(k)}\|^2 $")
+    ax.set_yscale("log")
+    ax.legend(bbox_to_anchor=(1.0, 0.85), loc="upper right", ncol=2)
+    fig.tight_layout()
+    fig.savefig(data_dir / "fig1_mse.pdf", transparent=True)
+    plt.close(fig)
 
-    ax1.set_xlabel("time step $n$")
-    # ax1.set_title("The time series of $\\mathrm{MSE}$")
-    ax1.set_ylabel(r"$ \frac{1}{m} \sum_{k=1}^m \mathbb{E} \|\delta^{(k)}\|^2 $")
-    ax1.set_yscale("log")
-    ax1.legend(bbox_to_anchor=(1.0, 0.85), loc="upper right", ncol=2)
-    fig1.tight_layout()
-    fig1.savefig(f"{data_dir}/l96-po-inflation_Pse.pdf", transparent=True)
 
-    # Off-diagonal ratio plot
-    fig2, ax2 = plt.subplots(figsize=(7, 4))
-    for k, method_name in enumerate(methods):
-        paramname = make_paramname(m, method_name, alpha_list, len(seed_list))
-        print(" loading param for off-diag:", paramname)
-        Xa = load_xa(data_dir, paramname)
-
-        color = colors[k % len(colors)]
-        line_cycle = get_linestyle_cycle()
-        marker_cycle = get_marker_cycle()
-
-        for i, xa in enumerate(Xa):
-            alpha = alpha_list[i]
-
-            ls = next(line_cycle)
-            marker = next(marker_cycle)
-
-            Pi = H.T @ H
-            Q = np.eye(J) - Pi
-            xa = xa[i_seed] # (Nt, m, J)
-            dX = xa - xa.mean(axis=1, keepdims=True) # (Nt, J)
-            P = (dX.swapaxes(-2, -1) @ dX) / (m - 1) # (J, J)
-            QPHt = Q @ P @ Pi.T
-            HPHt = Pi @ P @ Pi.T
-            rf = (
-                np.linalg.norm(QPHt, axis=(1, 2)) / np.linalg.norm(HPHt, axis=(1, 2))
-            )
-
-            ax2.plot(
-                time_ticks[:N_end],
-                rf[::per_vis][:N_end],
-                label=f"{display_method(method_name)} $\\alpha$={alpha}",
-                lw=0.5,
-                ls=ls,
-                color=color,
-                marker=marker,
-                ms=5,
-            )
-
-    # ax2.set_title("The off-diagonal ratio in the covariance")
-    ax2.set_ylabel(r"$\left|(I-\Pi)P_n\Pi\right|_F / \left|\Pi P_n \Pi\right|_F$")
-    ax2.set_xlabel("time step $n$")
-    ax2.set_ylim((0.0, 2.0))
-    ax2.legend(bbox_to_anchor=(1.0, 1.0), loc="upper right", ncol=2)
-    fig2.tight_layout()
-    fig2.savefig(f"{data_dir}/l96-po-inflation_offDiag.pdf", transparent=True)
-
-    # ------------------------------------------
-    # Last covariance plots
-    # ------------------------------------------
+def plot_fig2_abs_error(
+    data_dir,
+    x_true,
+    alpha_list_all,
+    alpha_list_fig,
+    methods,
+    xa_dict,
+    sample_seed_index,
+    sample_member_index,
+):
+    """Plot Figure 2: spatio-temporal absolute error of one ensemble member."""
     num_methods = len(methods)
-    num_alphas = len(alpha_list)
+    num_alphas = len(alpha_list_fig)
+    state_dim = x_true.shape[1]
 
-    observed_idx = np.where(np.diag(H.T @ H) > 0.5)[0]
-    unobserved_idx = np.where(np.diag(H.T @ H) <= 0.5)[0]
-    sort_idx = np.concatenate([observed_idx, unobserved_idx])
-    vmax = 1.0
-    vmin = -1.0
-
-    fig1, axes1 = plt.subplots(
-        num_methods,
-        num_alphas,
-        figsize=(8, 8 * num_methods / num_alphas),
-        gridspec_kw={"hspace": 0.1, "wspace": 0.05},
-    )
-    fig2, axes2 = plt.subplots(
-        num_methods, num_alphas, figsize=(8, 8 * num_methods / num_alphas)
-    )
-
-    if num_methods == 1 and num_alphas == 1:
-        axes1 = np.array([[axes1]])
-        axes2 = np.array([[axes2]])
-    elif num_methods == 1:
-        axes1 = axes1[np.newaxis, :]
-        axes2 = axes2[np.newaxis, :]
-    elif num_alphas == 1:
-        axes1 = axes1[:, np.newaxis]
-        axes2 = axes2[:, np.newaxis]
-
-    # safe small placeholders for colorbars (will be replaced)
-    first_ax1 = axes1.ravel()[0]
-    first_ax2 = axes2.ravel()[0]
-    im1 = first_ax1.imshow(
-        np.zeros((1, 1)), cmap="coolwarm", vmax=vmax, vmin=vmin, interpolation="none"
-    )
-    im2 = first_ax2.imshow(
-        np.zeros((1, 1)), cmap="coolwarm", vmax=vmax, vmin=vmin, interpolation="none"
-    )
-
-    for r_idx, method_name in enumerate(methods):
-        paramname = make_paramname(m, method_name, alpha_list, len(seed_list))
-        Xa = load_xa(data_dir, paramname)
-        for c, alpha in enumerate(alpha_list):
-            xa = Xa[c, i_seed]
-            dX = xa - xa.mean(axis=1, keepdims=True)
-            P = (dX.swapaxes(-2, -1) @ dX) / (m - 1)
-            P_last = P[-1]
-            P_last /= np.abs(P_last).max()
-
-            ax1 = axes1[r_idx, c]
-            im1 = ax1.imshow(
-                P_last, cmap="coolwarm", interpolation="none", vmax=vmax, vmin=vmin
-            )
-            if r_idx == 0:
-                ax1.set_title(f"$\\alpha$={alpha}")
-            if c == 0:
-                ax1.set_ylabel(display_method(method_name) + "\n" + "i")
-            if r_idx == num_methods - 1:
-                ax1.set_xlabel("j")
-            ax1.set_xticks([])
-            ax1.set_yticks([])
-
-            P_rearranged = P_last[sort_idx][:, sort_idx]
-            ax2 = axes2[r_idx, c]
-            im2 = ax2.imshow(
-                P_rearranged,
-                cmap="coolwarm",
-                interpolation="none",
-                vmax=vmax,
-                vmin=vmin,
-            )
-            if r_idx == 0:
-                ax2.set_title(f"$\\alpha$={alpha}")
-            if c == 0:
-                ax2.set_ylabel(display_method(method_name) + "\n" + "i")
-            if r_idx == num_methods - 1:
-                ax2.set_xlabel("j")
-            ax2.set_xticks([])
-            ax2.set_yticks([])
-
-    fig1.colorbar(im1, ax=axes1.ravel().tolist(), fraction=0.046, pad=0.04)
-    fig2.colorbar(im2, ax=axes2.ravel().tolist(), fraction=0.046, pad=0.04)
-    fig2.savefig(f"{data_dir}/normalized_last_covariance")
-
-    # ------------------------------------------
-    # Spatio-temporal: true & observations
-    # ------------------------------------------
-    print("Spatio-temporal Plot: State, Observations, Assimilations")
-    x_true_full = np.load(f"{data_dir}/x_true_l96_full.npy")
-    Y = load_y(data_dir, num_seeds)
-    y = Y[i_seed]
-
-    num_methods = len(methods)
-    num_alphas = len(alpha_list_vis_st)
-
-    x1 = x_true_full[n_start:n_end]
-    y_extend = (H.T @ y[n_start:n_end].T).T
-    y_mask = np.ma.masked_where(y_extend == 0.0, y_extend)
-    x2 = y_mask
-
-    vmax_ts = np.max(x1)
-    vmin_ts = np.min(x1)
-
-    fig1, ax1 = plt.subplots(1, 2, figsize=(8, 4))
-    im1 = ax1[0].imshow(
-        x1,
-        aspect=J / (n_end - n_start),
-        vmax=vmax_ts,
-        vmin=vmin_ts,
-        origin="lower",
-        interpolation="none",
-    )
-    ax1[0].set_ylabel("time $n$")
-    ax1[0].set_xlabel("space $i$")
-    ax1[0].set_title("x_true")
-
-    ax1[1].imshow(
-        x2,
-        aspect=J / (n_end - n_start),
-        vmax=vmax_ts,
-        vmin=vmin_ts,
-        origin="lower",
-        interpolation="none",
-    )
-    ax1[1].set_xlabel("space $i$")
-    ax1[1].set_title("y_obs")
-    ax1[1].set_yticks([])
-
-    cax1 = fig1.add_axes((0.92, 0.155, 0.03, 0.675))
-    fig1.colorbar(im1, cax=cax1)
-    # fig1.suptitle(
-    #     f"True State & Observations: from n={n_start + 1} to n={n_end}", fontsize=16
-    # )
-    fig1.savefig(f"{data_dir}/spatio_temporal_true_obs")
-
-    # ------------------------------------------
-    # Spatio-temporal: assimilations
-    # ------------------------------------------
-    fig2, axes2 = plt.subplots(
-        num_methods,
-        num_alphas,
-        figsize=(8, 8 * num_methods / num_alphas),
-        gridspec_kw={"hspace": 0.1, "wspace": 0.05},
-    )
-    if num_methods == 1 and num_alphas == 1:
-        axes2 = np.array([[axes2]])
-    elif num_methods == 1:
-        axes2 = axes2[np.newaxis, :]
-    elif num_alphas == 1:
-        axes2 = axes2[:, np.newaxis]
-
-    # placeholder for mappable
-    im_spatio = None
-
-    for r_idx, m_name in enumerate(methods):
-        paramname = make_paramname(m, m_name, alpha_list, len(seed_list))
-        Xa = load_xa(data_dir, paramname)
-        for a_idx, alpha_val in enumerate(alpha_list_vis_st):
-            x_assim = Xa[a_idx, i_seed, :, k_ens]
-            x3 = x_assim[n_start:n_end]
-
-            ax = axes2[r_idx, a_idx]
-            im_spatio = ax.imshow(
-                x3,
-                aspect=J / (n_end - n_start),
-                vmax=vmax_ts,
-                vmin=vmin_ts,
-                origin="lower",
-                interpolation="none",
-            )
-            if r_idx == 0:
-                ax.set_title(f"$\\alpha$={alpha_val}")
-                ax.set_xticks([])
-            elif r_idx == num_methods - 1:
-                ax.set_xlabel("$i$")
-                if a_idx == 0:
-                    ax.set_xlabel("space $i$")
-            if a_idx == 0:
-                ax.set_ylabel(display_method(m_name) + "\n" + "$n$")
-                if r_idx == num_methods - 1:
-                    ax.set_ylabel(display_method(m_name) + "\n" + "time $n$")
-            else:
-                ax.set_yticks([])
-
-    # fig2.suptitle(
-    #     f"Spatio-temporal Assimilations: from n={n_start + 1} to n={n_end}", fontsize=16
-    # )
-    if im_spatio is not None:
-        fig2.colorbar(im_spatio, ax=axes2.ravel().tolist(), fraction=0.046, pad=0.04)
-    fig2.savefig(f"{data_dir}/spatio_temporal_assimilations")
-
-    # ------------------------------------------
-    # Spatio-temporal: absolute errors
-    # ------------------------------------------
-    print("Spatio-temporal Plot: Absolute Errors")
-    x_true_full = np.load(f"{data_dir}/x_true_l96_full.npy")
-    x_t = x_true_full[n_start:n_end]
-
-    num_methods = len(methods)
-    num_alphas = len(alpha_list_vis_st)
-
-    # compute global vmax for consistent color scale
     global_vmax = 0.0
-    for m_name in methods:
-        paramname = make_paramname(m, m_name, alpha_list, len(seed_list))
-        Xa = load_xa(data_dir, paramname)
-        for a_idx in range(num_alphas):
-            x_assim = Xa[a_idx, i_seed].mean(axis=1)
-            e_assim = np.abs(x_assim[n_start:n_end] - x_t)
+    for method_name in methods:
+        xa = xa_dict[method_name]
+        for alpha in alpha_list_fig:
+            alpha_idx = alpha_list_all.index(alpha)
+            x_assim = xa[alpha_idx, sample_seed_index, :, sample_member_index]
+            e_assim = np.abs(x_assim - x_true)
             global_vmax = max(global_vmax, np.max(e_assim))
-
-    vmin_err = 0.0
-    vmax_err = max(0.0, global_vmax)
 
     fig, axes = plt.subplots(
         num_methods,
@@ -592,43 +362,410 @@ def main():
     elif num_alphas == 1:
         axes = axes[:, np.newaxis]
 
-    im_err = None
-    for r_idx, m_name in enumerate(methods):
-        paramname = make_paramname(m, m_name, alpha_list, len(seed_list))
-        Xa = load_xa(data_dir, paramname)
-        for a_idx, alpha_val in enumerate(alpha_list_vis_st):
-            x_assim = Xa[a_idx, i_seed, :, k_ens]
-            e_assim = np.abs(x_assim[n_start:n_end] - x_t)
+    im = None
+    for r_idx, method_name in enumerate(methods):
+        xa = xa_dict[method_name]
+        for a_idx, alpha in enumerate(alpha_list_fig):
+            alpha_idx = alpha_list_all.index(alpha)
+            x_assim = xa[alpha_idx, sample_seed_index, :, sample_member_index]
+            e_assim = np.abs(x_assim - x_true)
 
             ax = axes[r_idx, a_idx]
-            im_err = ax.imshow(
+            im = ax.imshow(
                 e_assim,
-                aspect=J / (n_end - n_start),
-                vmax=vmax_err,
-                vmin=vmin_err,
+                aspect=state_dim / len(x_true),
+                vmax=global_vmax,
+                vmin=0.0,
                 origin="lower",
                 interpolation="none",
                 cmap="flare_r",
             )
             if r_idx == 0:
-                ax.set_title(f"$\\alpha$={alpha_val}")
+                ax.set_title(f"$\\alpha$={alpha}")
                 ax.set_xticks([])
             elif r_idx == num_methods - 1:
-                ax.set_xlabel("$i$")
-                if a_idx == 0:
-                    ax.set_xlabel("space $i$")
+                ax.set_xlabel("space $i$")
             if a_idx == 0:
-                ax.set_ylabel(display_method(m_name) + "\n" + "$n$")
-                if r_idx == num_methods - 1:
-                    ax.set_ylabel(display_method(m_name) + "\n" + "time $n$")
+                ax.set_ylabel(display_method(method_name) + "\n" + "time $n$")
             else:
                 ax.set_yticks([])
 
-    if im_err is not None:
-        fig.colorbar(im_err, ax=axes.ravel().tolist(), fraction=0.046, pad=0.04)
+    if im is not None:
+        fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.046, pad=0.04)
+    fig.savefig(data_dir / "fig2_abs_error.pdf", transparent=True)
+    plt.close(fig)
 
-    # fig.suptitle(f"Absolute Errors: from n={n_start + 1} to n={n_end}", fontsize=16)
-    fig.savefig(f"{data_dir}/absolute_errors_all")
+
+def plot_fig3_covariance(
+    data_dir,
+    h,
+    alpha_list_all,
+    methods,
+    xa_dict,
+    sample_seed_index,
+):
+    """Plot Figure 3: normalized and rearranged covariance matrices."""
+    num_methods = len(methods)
+    num_alphas = len(alpha_list_all)
+    observed_idx = np.where(np.diag(h.T @ h) > 0.5)[0]
+    unobserved_idx = np.where(np.diag(h.T @ h) <= 0.5)[0]
+    sort_idx = np.concatenate([observed_idx, unobserved_idx])
+    vmax = 1.0
+    vmin = -1.0
+
+    fig, axes = plt.subplots(
+        num_methods,
+        num_alphas,
+        figsize=(8, 8 * num_methods / num_alphas),
+        gridspec_kw={"hspace": 0.1, "wspace": 0.05},
+    )
+    if num_methods == 1 and num_alphas == 1:
+        axes = np.array([[axes]])
+    elif num_methods == 1:
+        axes = axes[np.newaxis, :]
+    elif num_alphas == 1:
+        axes = axes[:, np.newaxis]
+
+    im = axes.ravel()[0].imshow(
+        np.zeros((1, 1)), cmap="coolwarm", vmax=vmax, vmin=vmin, interpolation="none"
+    )
+    for r_idx, method_name in enumerate(methods):
+        xa = xa_dict[method_name]
+        for c_idx, alpha in enumerate(alpha_list_all):
+            xa_sample = xa[c_idx, sample_seed_index]
+            d_x = xa_sample - xa_sample.mean(axis=1, keepdims=True)
+            p = (d_x.swapaxes(-2, -1) @ d_x) / (xa_sample.shape[1] - 1)
+            p_last = p[-1]
+            scale = np.abs(p_last).max()
+            if scale > 0.0:
+                p_last = p_last / scale
+            p_rearranged = p_last[sort_idx][:, sort_idx]
+
+            ax = axes[r_idx, c_idx]
+            im = ax.imshow(
+                p_rearranged,
+                cmap="coolwarm",
+                interpolation="none",
+                vmax=vmax,
+                vmin=vmin,
+            )
+            if r_idx == 0:
+                ax.set_title(f"$\\alpha$={alpha}")
+            if c_idx == 0:
+                ax.set_ylabel(display_method(method_name) + "\n" + "i")
+            if r_idx == num_methods - 1:
+                ax.set_xlabel("j")
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+    fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.046, pad=0.04)
+    fig.savefig(data_dir / "fig3_covariance.pdf", transparent=True)
+    plt.close(fig)
+
+
+def plot_fig4_offdiag_ratio(
+    data_dir,
+    h,
+    alpha_list_all,
+    methods,
+    xa_dict,
+    sample_seed_index,
+    per_vis=20,
+    num_points=50,
+):
+    """Plot Figure 4: off-diagonal/observed covariance ratio."""
+    fig, ax = plt.subplots(figsize=(7, 4))
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    time_ticks = np.arange(next(iter(xa_dict.values())).shape[2] // per_vis) * per_vis + 1
+    pi = h.T @ h
+    q = np.eye(pi.shape[0]) - pi
+
+    for k, method_name in enumerate(methods):
+        xa = xa_dict[method_name]
+        color = colors[k % len(colors)]
+        line_cycle = visualize.get_linestyle_cycle()
+        marker_cycle = visualize.get_marker_cycle()
+
+        for i, alpha in enumerate(alpha_list_all):
+            xa_sample = xa[i, sample_seed_index]
+            d_x = xa_sample - xa_sample.mean(axis=1, keepdims=True)
+            p = (d_x.swapaxes(-2, -1) @ d_x) / (xa_sample.shape[1] - 1)
+            num = np.linalg.norm(q @ p @ pi.T, axis=(1, 2))
+            den = np.linalg.norm(pi @ p @ pi.T, axis=(1, 2))
+            ratio = np.divide(
+                num,
+                den,
+                out=np.full_like(num, np.nan),
+                where=den > 0.0,
+            )
+
+            ax.plot(
+                time_ticks[:num_points],
+                ratio[::per_vis][:num_points],
+                label=f"{display_method(method_name)} $\\alpha$={alpha}",
+                lw=0.5,
+                ls=next(line_cycle),
+                color=color,
+                marker=next(marker_cycle),
+                ms=5,
+            )
+
+    ax.set_ylabel(r"$\left|(I-\Pi)P_n\Pi\right|_F / \left|\Pi P_n \Pi\right|_F$")
+    ax.set_xlabel("time step $n$")
+    ax.set_ylim((0.0, 2.0))
+    ax.legend(bbox_to_anchor=(1.0, 1.0), loc="upper right", ncol=2)
+    fig.tight_layout()
+    fig.savefig(data_dir / "fig4_offdiag_ratio.pdf", transparent=True)
+    plt.close(fig)
+
+
+def plot_fig5_true_obs(data_dir, x_true, h, observations, sample_seed_index):
+    """Plot Figure 5: true state and observations."""
+    state_dim = x_true.shape[1]
+    y = observations[sample_seed_index]
+    y_extended = (h.T @ y.T).T
+    y_mask = np.ma.masked_where(y_extended == 0.0, y_extended)
+    vmax = np.max(x_true)
+    vmin = np.min(x_true)
+
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+    im = axes[0].imshow(
+        x_true,
+        aspect=state_dim / len(x_true),
+        vmax=vmax,
+        vmin=vmin,
+        origin="lower",
+        interpolation="none",
+    )
+    axes[0].set_ylabel("time $n$")
+    axes[0].set_xlabel("space $i$")
+    axes[0].set_title("true state")
+
+    axes[1].imshow(
+        y_mask,
+        aspect=state_dim / len(x_true),
+        vmax=vmax,
+        vmin=vmin,
+        origin="lower",
+        interpolation="none",
+    )
+    axes[1].set_xlabel("space $i$")
+    axes[1].set_title("observation")
+    axes[1].set_yticks([])
+
+    cax = fig.add_axes((0.92, 0.155, 0.03, 0.675))
+    fig.colorbar(im, cax=cax)
+    fig.savefig(data_dir / "fig5_true_obs.pdf", transparent=True)
+    plt.close(fig)
+
+
+def plot_fig6_analysis_states(
+    data_dir,
+    x_true,
+    alpha_list_all,
+    alpha_list_fig,
+    methods,
+    xa_dict,
+    sample_seed_index,
+    sample_member_index,
+):
+    """Plot Figure 6: sample-path analysis states."""
+    num_methods = len(methods)
+    num_alphas = len(alpha_list_fig)
+    state_dim = x_true.shape[1]
+    vmax = np.max(x_true)
+    vmin = np.min(x_true)
+
+    fig, axes = plt.subplots(
+        num_methods,
+        num_alphas,
+        figsize=(8, 8 * num_methods / num_alphas),
+        gridspec_kw={"hspace": 0.1, "wspace": 0.05},
+    )
+    if num_methods == 1 and num_alphas == 1:
+        axes = np.array([[axes]])
+    elif num_methods == 1:
+        axes = axes[np.newaxis, :]
+    elif num_alphas == 1:
+        axes = axes[:, np.newaxis]
+
+    im = None
+    for r_idx, method_name in enumerate(methods):
+        xa = xa_dict[method_name]
+        for a_idx, alpha in enumerate(alpha_list_fig):
+            alpha_idx = alpha_list_all.index(alpha)
+            x_assim = xa[alpha_idx, sample_seed_index, :, sample_member_index]
+            ax = axes[r_idx, a_idx]
+            im = ax.imshow(
+                x_assim,
+                aspect=state_dim / len(x_true),
+                vmax=vmax,
+                vmin=vmin,
+                origin="lower",
+                interpolation="none",
+            )
+            if r_idx == 0:
+                ax.set_title(f"$\\alpha$={alpha}")
+                ax.set_xticks([])
+            elif r_idx == num_methods - 1:
+                ax.set_xlabel("space $i$")
+            if a_idx == 0:
+                ax.set_ylabel(display_method(method_name) + "\n" + "time $n$")
+            else:
+                ax.set_yticks([])
+
+    if im is not None:
+        fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.046, pad=0.04)
+    fig.savefig(data_dir / "fig6_analysis_states.pdf", transparent=True)
+    plt.close(fig)
+
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Run the Lorenz 96 PO experiments and generate manuscript figures."
+    )
+    parser.add_argument(
+        "--data-dir",
+        default="data/reproduce",
+        help="Directory used for cached arrays and generated figures.",
+    )
+    parser.add_argument(
+        "--recompute",
+        action="store_true",
+        help="Regenerate cached arrays even if they already exist.",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    state_dim = 60
+    forcing = 8.0
+    dt = 0.01
+    spinup_steps = 20 * 360
+    num_steps = 20 * 50
+
+    obs_per = 1
+    obs_noise_std = 1.0
+
+    ensemble_size = 10
+    seed_list = np.arange(20)
+    alpha_list_all = [0.0, 0.5, 2.0, 10.0, 100.0]
+    alpha_list_fig = [0.0, 0.5, 2.0]
+    methods = ["po_add", "po_proj"]
+
+    sample_seed_index = 0
+    sample_member_index = 0
+    # The manuscript uses k = 1 for the sample-path plots; Python indexing is 0-based.
+
+    save_run_parameters(
+        data_dir=data_dir,
+        parameters={
+            "state_dim": state_dim,
+            "forcing": forcing,
+            "dt": dt,
+            "spinup_steps": spinup_steps,
+            "num_steps": num_steps,
+            "obs_per": obs_per,
+            "obs_noise_std": obs_noise_std,
+            "ensemble_size": ensemble_size,
+            "seed_list": seed_list.tolist(),
+            "alpha_list_all": alpha_list_all,
+            "alpha_list_fig": alpha_list_fig,
+            "methods": methods,
+            "sample_seed_index": sample_seed_index,
+            "sample_member_index": sample_member_index,
+            "recompute": args.recompute,
+        },
+    )
+
+    x0 = forcing * np.ones(state_dim)
+    x0[19] *= 1.001
+    x_true = generate_true_trajectory(
+        data_dir=data_dir,
+        x0=x0,
+        forcing=forcing,
+        dt=dt,
+        spinup_steps=spinup_steps,
+        num_steps=num_steps,
+    )
+
+    h = build_observation_operator(state_dim)
+    print("H.shape:", h.shape)
+    print("rank(H):", np.linalg.matrix_rank(h))
+
+    observations, xa_dict = run_assimilation(
+        data_dir=data_dir,
+        x_true=x_true,
+        h=h,
+        forcing=forcing,
+        r=obs_noise_std,
+        dt=dt,
+        obs_per=obs_per,
+        ensemble_size=ensemble_size,
+        alpha_list=alpha_list_all,
+        methods=methods,
+        seed_list=seed_list,
+        recompute=args.recompute,
+    )
+
+    plot_fig1_mse(
+        data_dir=data_dir,
+        x_true=x_true,
+        h=h,
+        r=obs_noise_std,
+        alpha_list_all=alpha_list_all,
+        alpha_list_fig=alpha_list_fig,
+        methods=methods,
+        xa_dict=xa_dict,
+    )
+    plot_fig2_abs_error(
+        data_dir=data_dir,
+        x_true=x_true,
+        alpha_list_all=alpha_list_all,
+        alpha_list_fig=alpha_list_fig,
+        methods=methods,
+        xa_dict=xa_dict,
+        sample_seed_index=sample_seed_index,
+        sample_member_index=sample_member_index,
+    )
+    plot_fig3_covariance(
+        data_dir=data_dir,
+        h=h,
+        alpha_list_all=alpha_list_all,
+        methods=methods,
+        xa_dict=xa_dict,
+        sample_seed_index=sample_seed_index,
+    )
+    plot_fig4_offdiag_ratio(
+        data_dir=data_dir,
+        h=h,
+        alpha_list_all=alpha_list_all,
+        methods=methods,
+        xa_dict=xa_dict,
+        sample_seed_index=sample_seed_index,
+    )
+    plot_fig5_true_obs(
+        data_dir=data_dir,
+        x_true=x_true,
+        h=h,
+        observations=observations,
+        sample_seed_index=sample_seed_index,
+    )
+    plot_fig6_analysis_states(
+        data_dir=data_dir,
+        x_true=x_true,
+        alpha_list_all=alpha_list_all,
+        alpha_list_fig=alpha_list_fig,
+        methods=methods,
+        xa_dict=xa_dict,
+        sample_seed_index=sample_seed_index,
+        sample_member_index=sample_member_index,
+    )
 
 
 if __name__ == "__main__":
