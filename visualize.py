@@ -2,11 +2,20 @@ import itertools
 import enum
 import matplotlib.pyplot as plt
 import seaborn as sns
-from matplotlib_inline.backend_inline import set_matplotlib_formats
+
+# notebook environments only
+try:
+    from matplotlib_inline.backend_inline import set_matplotlib_formats
+
+    try:
+        set_matplotlib_formats("pdf", "svg")
+    except Exception:
+        pass
+except ImportError:
+    pass
 
 # from states import to_mat_rep
 
-set_matplotlib_formats("pdf", "svg")
 plt.style.use("vis.mplstyle")
 
 
