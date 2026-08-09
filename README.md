@@ -70,9 +70,10 @@ To regenerate every data directory instead of reusing it:
 
 ## Cache contract
 
-Each data directory passed to `run_experiment` is cached as a single unit: it is written, reused, and regenerated as a whole,
-never file by file. The public interface is the command line above; internal
-functions and configuration dictionaries may change.
+Each data directory passed to `run_experiment` is cached as a single unit: it
+is written, reused, and regenerated as a whole, never file by file. The public
+interface is the command line above; internal functions and configuration
+dictionaries may change.
 
 - A successful data directory has a `.complete` marker.
 - If the marker exists, arrays are reused directly.
