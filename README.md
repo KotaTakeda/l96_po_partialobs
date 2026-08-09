@@ -255,7 +255,7 @@ The retained metrics are:
 `member_increment_max_abs_unobserved` as a numerical quality-control residual.
 No fixed threshold is used to turn this residual into an exception.
 
-## Reproducibility
+<!-- ## Reproducibility
 
 Runs are seeded, so rerunning the same command reproduces the reported values.
 Two caveats are worth stating.
@@ -276,4 +276,4 @@ conclusion, since the $\alpha=0$ error exceeds the reference level $4N_yr^2$ by
 more than an order of magnitude in either case.
 
 Set `OMP_NUM_THREADS=1` (and `VECLIB_MAXIMUM_THREADS=1` on macOS) before
-running if you need a stricter bitwise match for the uninflated case.
+running if you need a stricter bitwise match for the uninflated case. -->
