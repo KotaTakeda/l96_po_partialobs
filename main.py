@@ -61,7 +61,7 @@ def initial_ensembles_path(data_dir):
 
 
 def _complete_marker_path(data_dir):
-    """Return the path of the completion marker for the run directory data_dir."""
+    """Return the path of the completion marker for the data directory data_dir."""
     return data_dir / ".complete"
 
 
@@ -621,7 +621,7 @@ def run_experiment(cfg, data_dir, recompute=False, show_sample_paths=False):
 
     # Atomic marker write: all computation and figures succeeded
     _tmp = data_dir / ".complete.tmp"
-    _tmp.write_text("run complete\n", encoding="utf-8")
+    _tmp.write_text("complete\n", encoding="utf-8")
     _tmp.replace(_marker)
 
 
