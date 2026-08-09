@@ -37,7 +37,7 @@ Run the commands below from the repository root: the plot style is loaded as
 .venv/bin/python main.py --data-dir data/reproduce
 ```
 
-The command runs or reuses the following experiment bundles:
+The command runs or reuses the following experiment run directories:
 
 1. Figures 1--4 and 6--7: $2/3$-pattern observations, $m=10$,
    $\alpha=0,0.5,2,10,100$, and 20 seeds. Figures 1, 2, and 7 display only
@@ -62,7 +62,7 @@ To additionally overlay all seed-wise sample paths with opacity 0.3:
 This display-only option does not change or recompute the experiment cache. It
 overwrites the same PDF files with the sample-path overlay version.
 
-To regenerate every bundle instead of reusing it:
+To regenerate every run directory instead of reusing it:
 
 ```bash
 .venv/bin/python main.py --data-dir data/reproduce --recompute
@@ -70,17 +70,18 @@ To regenerate every bundle instead of reusing it:
 
 ## Cache contract
 
-Each data directory passed to `run_experiment` is one indivisible cache bundle.
-The public interface is the command line above; internal functions and
-configuration dictionaries may change.
+Each data directory passed to `run_experiment` is a run directory, and it is
+cached as a single unit: it is written, reused, and regenerated as a whole,
+never file by file. The public interface is the command line above; internal
+functions and configuration dictionaries may change.
 
-- A successful bundle has a `.complete` marker.
+- A successful run directory has a `.complete` marker.
 - If the marker exists, arrays are reused directly.
-- If the marker is absent, the whole bundle is recomputed.
-- `--recompute` regenerates the whole bundle.
+- If the marker is absent, the whole run directory is recomputed.
+- `--recompute` regenerates the whole run directory.
 - `run_parameters.json` records provenance; it is not a second validation
   state machine.
-- If a marked bundle is damaged or incomplete, rerun with `--recompute`.
+- If a marked run directory is damaged or incomplete, rerun with `--recompute`.
 
 Do not mix individual cache files between experiment directories. In
 particular, the projection comparisons use paired seeds and must retain their
@@ -110,11 +111,11 @@ data/reproduce/
 ```
 
 The tree lists only the figures and tables. Alongside them, `data/reproduce/`
-is itself an experiment bundle, and every bundle also contains
+is itself a run directory, and every run directory also contains
 `run_parameters.json`, `true_trajectory.npy`, `observations.npy`,
 `initial_ensembles.npy`, one `analysis_ensembles.npy` per method under
 `po_add/` and `po_proj/`, and a `.complete` marker. Projection-comparison
-bundles additionally contain `diagnostics.npz`, whose arrays are
+run directories additionally contain `diagnostics.npz`, whose arrays are
 
 | Key | Shape | Content |
 | --- | --- | --- |
