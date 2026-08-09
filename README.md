@@ -11,7 +11,7 @@ the manuscript figures and the covariance-projection comparison.
 | Module | Role |
 | --- | --- |
 | [`main.py`](./main.py) | Experiment configuration, assimilation runs, caching, summary tables, command line |
-| [`figures.py`](./figures.py) | Manuscript error metric, seed-variability band, plot style, and the Figure 1--7 renderers |
+| [`figures.py`](./figures.py) | Weighted mean squared error, seed-variability band, plot style, and the Figure 1--7 renderers |
 
 `main.py` imports `figures.py`, and `figures.py` imports nothing from this
 repository, so the dependency is one-directional.
@@ -25,7 +25,7 @@ python -m venv .venv
 
 The dependencies are `numpy`, `matplotlib`, `seaborn`, and
 [`da_py`](https://github.com/KotaTakeda/da_py), which provides the Lorenz 96
-model and the data-assimilation implementation. `seaborn` is required because
+model and the data assimilation routines. `seaborn` is required because
 Figure 2 uses its `flare` colormap.
 
 Run the commands below from the repository root: the plot style is loaded as
@@ -39,17 +39,17 @@ Run the commands below from the repository root: the plot style is loaded as
 
 The command runs or reuses the following experiment bundles:
 
-1. Figures 1--4 and 6--7: 2/3 observations, $m=10$,
+1. Figures 1--4 and 6--7: $2/3$-pattern observations, $m=10$,
    $\alpha=0,0.5,2,10,100$, and 20 seeds. Figures 1, 2, and 7 display only
    $\alpha=0,0.5,2$; Figures 3 and 4 use all five values.
-2. Figure 5 projection comparison: 1/2 alternating observations, $\alpha=0.5$,
+2. Figure 5 projection comparison: $1/2$-pattern (alternating) observations, $\alpha=0.5$,
    $m=10,20,40,80$, and 20 paired seeds.
 
-The common parameters are state dimension $J=60$, forcing $F=8$, time step
-$0.01$, observation-noise standard deviation $r=1$, and seeds $0,\ldots,19$.
+The common parameters are the state dimension $J=60$, the forcing $F=8$, the
+integration time step $\Delta t=0.01$, observation-noise standard deviation $r=1$, and seeds $0,\ldots,19$.
 Figures 2 and 7 show seed 0 and ensemble member $k=1$ (Python index 0).
 
-By default, all uncertainty displays use the arithmetic seed mean and the
+By default, all uncertainty displays use the mean over seeds and the
 empirical 2.5th--97.5th percentile range across the 20 seeds. In time-series
 figures this range is evaluated pointwise.
 
@@ -88,7 +88,7 @@ common generation conditions.
 
 ## Outputs
 
-A fresh run creates the following principal outputs under `data/reproduce/`:
+A fresh run creates the following main outputs under `data/reproduce/`:
 
 ```text
 data/reproduce/
@@ -123,15 +123,16 @@ bundles additionally contain `diagnostics.npz`, whose arrays are
 | `method_names`, `alphas`, `seeds`, `time_index` | — | Coordinates for the arrays above |
 
 A complete run from scratch writes about 3.6 GB, most of it the analysis
-ensembles, and took roughly 40 minutes of wall-clock time on an Apple M4 Max
-(7 minutes of CPU time; the run is dominated by writing the cached arrays).
+ensembles, and takes roughly 40 minutes of wall-clock time on an Apple M4 Max
+(7 minutes of CPU time; the run is I/O bound, dominated by writing the cached
+arrays).
 Reusing the cache instead regenerates the figures and tables in seconds.
 
 ### Manuscript figures
 
 | Output | Content |
 | --- | --- |
-| `fig1_mse.pdf` | Manuscript weighted-error time series |
+| `fig1_mse.pdf` | Time series of the weighted mean squared error of the manuscript |
 | `fig1_summary.csv` | Table-ready aggregate statistics corresponding to Figure 1 |
 | `fig2_abs_error.pdf` | Spatio-temporal absolute error |
 | `fig3_covariance.pdf` | Normalized, rearranged covariance matrices |
@@ -151,15 +152,14 @@ $$
 \right)
 $$
 
-on a logarithmic axis. The emphasized curve is the arithmetic seed mean and the
+on a logarithmic axis. The emphasized curve is the mean over seeds and the
 shaded region is the pointwise empirical 2.5th--97.5th percentile range. The
 `--show-sample-paths` option additionally overlays all 20 seed-wise results.
 
-`fig1_summary.csv` is a portable source for the manuscript table. For each
-method and inflation value, the Figure 1 weighted error is first averaged over
+`fig1_summary.csv` is a machine-readable source for the manuscript table. For each
+method and inflation value, the Figure 1 weighted mean squared error is first averaged over
 analysis times $n=501,\ldots,1000$ within each seed. The `mse` column reports
-the arithmetic mean and
-empirical 2.5th and 97.5th percentiles of those seed-wise time averages, along
+the mean and the empirical 2.5th and 97.5th percentiles of those seed-wise time averages, along
 with the number of seeds, the included analysis-time range, and the reference
 level $4N_y r^2$. Thus, its percentiles summarize time-aggregated seed values;
 they are distinct from the pointwise percentile ranges shown in Figure 1.
@@ -171,14 +171,14 @@ $$
 $$
 
 as defined in the manuscript (Section 4, preceding Figure 4). The emphasized
-curves are the arithmetic seed mean, approximating $\mathbb{E}[\mathcal{R}_n]$,
+curves are the mean over seeds, which approximates $\mathbb{E}[\mathcal{R}_n]$,
 and the shaded regions are the pointwise empirical 2.5th--97.5th percentile
 ranges. The seed-wise paths are optional.
 
 ### Projection-comparison figure
 
-`fig5_projection_comparison.pdf` has two panels, both using the alternating
-1/2-observation experiment, $\alpha=0.5$, $m\in\{10,20,40,80\}$, and 20
+`fig5_projection_comparison.pdf` has two panels, both using the
+$1/2$-pattern observation experiment, $\alpha=0.5$, $m\in\{10,20,40,80\}$, and 20
 seeds. All scalar time averages use all available analysis times $n=1,\ldots,1000$.
 
 - **(a)** Plots the root mean square over time of the analysis increment on the
@@ -197,16 +197,17 @@ seeds. All scalar time averages use all available analysis times $n=1,\ldots,100
   where $\mathcal{I}^{\mathrm{U}}$ indexes the unobserved components and the
   overline denotes the ensemble mean, following the manuscript definition.
 
-  Seed values, their arithmetic mean, and the empirical 2.5th--97.5th percentile
+  Seed values, their mean, and the empirical 2.5th--97.5th percentile
   range are displayed for both `add` and `add-proj`. The `add-proj` value is
   exactly zero by construction (projection removes the direct unobserved analysis
   increment), so its seed points, mean marker, and error bars all appear at zero.
 
-- **(b)** Plots the per-seed paired ratio of the time-averaged weighted error,
+- **(b)** Plots the per-seed paired ratio of the time-averaged weighted mean squared
+  error,
   `add`/`add-proj`. Scalar time averages use all available analysis times
   $n=1,\ldots,1000$.
   Black points are seed-wise paired ratios and the black error bar gives their
-  arithmetic mean and empirical 2.5th--97.5th percentile range. The vertical
+  mean and empirical 2.5th--97.5th percentile range. The vertical
   axis is linear starting at zero; the dashed line marks ratio 1.
 
 The figure compares how covariance projection changes the information-transfer
@@ -215,7 +216,7 @@ algorithm-ranking benchmark. A nonzero `add` increment in panel (a) measures
 the amount of direct transfer; by itself it does not prove an immediate error
 improvement.
 
-`fig5_summary.csv` is a portable source for the manuscript table accompanying
+`fig5_summary.csv` is a machine-readable source for the manuscript table accompanying
 Figure 5, in the same role that `fig1_summary.csv` plays for Figure 1. It is
 wide-form with one row per ensemble size and the columns
 
@@ -225,7 +226,7 @@ mse_ratio,mse_ratio_p2_5,mse_ratio_p97_5,num_seeds,analysis_time_start,analysis_
 ```
 
 `increment_rms` is the panel (a) quantity for `add` and `mse_ratio` is the
-panel (b) paired ratio; both are reported as the arithmetic seed mean with the
+panel (b) paired ratio; both are reported as the mean over seeds with the
 empirical 2.5th and 97.5th percentiles, time-averaged over all analysis times
 $n=1,\ldots,1000$. The `add-proj` increment is identically zero by construction
 and therefore has no column.
@@ -240,7 +241,7 @@ every per-seed value and additional metrics.
 `projection_comparison/summary.csv` is the long-form record of the same
 experiment. Its columns are
 `record_type,ensemble_size,alpha,seed,method,metric,estimate,p2_5,p97_5`.
-Aggregate rows report the arithmetic seed mean and empirical 2.5th and 97.5th
+Aggregate rows report the mean over seeds and the empirical 2.5th and 97.5th
 percentiles; per-seed rows leave the percentile columns empty.
 All scalar time averages in this summary use all available analysis times
 $n=1,\ldots,1000$. (Figure 1 summary uses $n=501,\ldots,1000$; see `fig1_summary.csv`.)
