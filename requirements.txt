@@ -1,7 +1,4 @@
 numpy
-scipy
-jupyter
 matplotlib
 seaborn
-tqdm
 git+https://github.com/KotaTakeda/da_py.git@v0.5.2a

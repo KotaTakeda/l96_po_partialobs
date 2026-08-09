@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Reproduce the Lorenz 96 PO experiments reported in the manuscript.
 
 The script runs the perturbed-observation (PO) filter with additive inflation
@@ -8,27 +7,32 @@ paper.
 """
 
 import argparse
+import csv
 import json
+import subprocess
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 from da.l96 import lorenz96
 from da.po import PO
 from da.scheme import rk4
 
-import visualize
+from figures import (
+    display_method,
+    mean_empirical_percentile_band,
+    plot_fig1_mse,
+    plot_fig2_abs_error,
+    plot_fig3_covariance,
+    plot_fig4_offdiag_ratio,
+    plot_fig5_projection_comparison,
+    plot_fig6_true_obs,
+    plot_fig7_analysis_states,
+    weighted_error_per_seed,
+)
 
-plt.rcParams["text.usetex"] = False
-
-
-def display_method(method_name):
-    """Return the label used in the manuscript figures."""
-    if method_name == "po_add":
-        return "add"
-    if method_name == "po_proj":
-        return "add-proj"
-    return method_name.replace("po_", "")
+FIG1_SUMMARY_BASENAME = "fig1_summary.csv"
+FIG5_SUMMARY_BASENAME = "fig5_summary.csv"
+TIME_AVERAGE_START = 501
 
 
 def true_trajectory_path(data_dir):
@@ -51,18 +55,21 @@ def parameters_path(data_dir):
     return data_dir / "run_parameters.json"
 
 
+def initial_ensembles_path(data_dir):
+    """Return the canonical cache path for initial ensembles."""
+    return data_dir / "initial_ensembles.npy"
+
+
+def _complete_marker_path(data_dir):
+    """Return the path of the completion marker for the data directory data_dir."""
+    return data_dir / ".complete"
+
+
 def load_npy(path):
     """Load an ``.npy`` file and print its shape for traceability."""
     array = np.load(path)
     print("loaded:", path, array.shape)
     return array
-
-
-def maybe_load_npy(path):
-    """Load an ``.npy`` file if it exists."""
-    if path.exists():
-        return load_npy(path)
-    return None
 
 
 def save_run_parameters(data_dir, parameters):
@@ -74,31 +81,118 @@ def save_run_parameters(data_dir, parameters):
     print("saved:", path)
 
 
-def loss_sq(x, y):
-    """Squared Euclidean loss summed over the state dimension."""
-    return np.sum((x - y) ** 2, axis=-1)
 
 
-def stats(x):
-    """Return mean and std over the first axis."""
-    return x.mean(axis=0), x.std(axis=0)
 
 
-def build_observation_operator(state_dim):
+def time_average_per_seed(values):
+    """Average seed-wise time series over analysis steps 501--1000."""
+    return np.asarray(values)[:, TIME_AVERAGE_START - 1 :].mean(axis=1)
+
+
+def time_average_per_seed_all(values):
+    """Average seed-wise time series over all available analysis steps (n=1,...,N).
+
+    Used exclusively for Figure 5 / projection-comparison aggregation so that
+    Figure 1 summary (which uses time_average_per_seed) stays isolated.
+    """
+    return np.asarray(values).mean(axis=1)
+
+
+def write_fig1_summary_csv(
+    data_dir,
+    x_true,
+    h,
+    r,
+    alpha_list_all,
+    alpha_list_fig,
+    methods,
+    xa_dict,
+):
+    """Write table-ready time-aggregated statistics corresponding to Figure 1.
+
+    The Figure 1 weighted error is first averaged over analysis times from
+    ``TIME_AVERAGE_START`` onward within each seed. The CSV then reports
+    the arithmetic mean and empirical 2.5th--97.5th percentiles of those
+    seed-wise time averages.
+    """
+    rows = []
+    alpha_index_map = {alpha: alpha_list_all.index(alpha) for alpha in alpha_list_fig}
+    for method_name in methods:
+        for alpha in alpha_list_fig:
+            alpha_idx = alpha_index_map[alpha]
+            values = weighted_error_per_seed(
+                x_true,
+                h,
+                xa_dict[method_name][alpha_idx],
+            )
+            seed_time_means = time_average_per_seed(values)
+            mean, p2_5, p97_5 = mean_empirical_percentile_band(seed_time_means)
+            rows.append(
+                {
+                    "method": display_method(method_name),
+                    "alpha": alpha,
+                    "mse": mean,
+                    "p2_5": p2_5,
+                    "p97_5": p97_5,
+                    "num_seeds": values.shape[0],
+                    "analysis_time_start": TIME_AVERAGE_START,
+                    "analysis_time_end": values.shape[1],
+                    "reference_4_Ny_r2": 4 * np.linalg.matrix_rank(h) * r**2,
+                }
+            )
+
+    path = data_dir / FIG1_SUMMARY_BASENAME
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    print("saved:", path)
+
+
+def build_observation_operator(state_dim, pattern="two_of_three"):
     """Return the partial observation operator from Definition 2.1."""
+    _unobserved = {
+        "two_of_three": slice(2, None, 3),
+        "alternating": slice(1, None, 2),
+    }
     h_diag = np.ones(state_dim)
-    h_diag[2::3] = 0
+    h_diag[_unobserved[pattern]] = 0
     h = np.diag(h_diag)
     return h[h_diag != 0]
 
 
-def generate_true_trajectory(data_dir, x0, forcing, dt, spinup_steps, num_steps):
+def compute_diagnostics(Xf, Xa, unobserved_idx):
+    """Return the direct unobserved analysis-increment time series for one run.
+
+    Parameters
+    ----------
+    Xf, Xa : (time, member, state)
+    unobserved_idx : 1-D index array
+
+    Returns
+    -------
+    dict with one key of shape (time,).
+    """
+    xa_mean = Xa.mean(axis=1)  # (time, state)
+    xf_mean = Xf.mean(axis=1)  # (time, state)
+
+    mean_increment_sq_unobserved = (
+        (xa_mean[:, unobserved_idx] - xf_mean[:, unobserved_idx]) ** 2
+    ).mean(axis=-1)
+
+    return {
+        "mean_increment_sq_unobserved": mean_increment_sq_unobserved,
+    }
+
+
+def generate_true_trajectory(
+    data_dir, x0, forcing, dt, spinup_steps, num_steps, recompute=False
+):
     """Load or generate the true Lorenz 96 trajectory after spin-up."""
     path = true_trajectory_path(data_dir)
-    x_true = maybe_load_npy(path)
-    if x_true is not None:
-        return x_true
-
+    if not recompute:
+        return load_npy(path)
     scheme = rk4
     params = (forcing,)
     result = np.zeros((spinup_steps + num_steps, len(x0)))
@@ -107,7 +201,6 @@ def generate_true_trajectory(data_dir, x0, forcing, dt, spinup_steps, num_steps)
     for n in range(1, spinup_steps + num_steps):
         x = scheme(lorenz96, n * dt, x, params, dt)
         result[n] = x
-
     x_true = result[spinup_steps:]
     np.save(path, x_true)
     print("generated:", path, x_true.shape)
@@ -161,19 +254,26 @@ def run_assimilation(
     methods,
     seed_list,
     recompute=False,
+    diagnostics_path=None,
+    unobserved_idx=None,
+    load_analysis_ensembles=True,
 ):
     """Run the PO experiments and cache analysis ensembles and observations."""
     y_path = observations_path(data_dir)
     obs_dim = h.shape[0]
     state_dim = x_true.shape[1]
     observation_cov = (r**2) * np.eye(obs_dim)
-    observations = None
-    initial_ensembles = None
+
+    if diagnostics_path is not None:
+        diagnostics_path = Path(diagnostics_path)
+        unobserved_idx = np.asarray(unobserved_idx)
+
+    ie_path = initial_ensembles_path(data_dir)
 
     if not recompute:
-        observations = maybe_load_npy(y_path)
-
-    if observations is None:
+        observations = load_npy(y_path)
+        initial_ensembles = load_npy(ie_path)
+    else:
         observations, initial_ensembles = generate_observations_and_initial_ensembles(
             x_true=x_true,
             h=h,
@@ -183,15 +283,16 @@ def run_assimilation(
         )
         np.save(y_path, observations)
         print("saved:", y_path, observations.shape)
+        np.save(ie_path, initial_ensembles)
+        print("saved:", ie_path, initial_ensembles.shape)
 
-    if initial_ensembles is None:
-        _, initial_ensembles = generate_observations_and_initial_ensembles(
-            x_true=x_true,
-            h=h,
-            r=r,
-            ensemble_size=ensemble_size,
-            seed_list=seed_list,
-        )
+    if (
+        diagnostics_path is not None
+        and not recompute
+        and not load_analysis_ensembles
+        and diagnostics_path.exists()
+    ):
+        return observations, {}
 
     dt_obs = dt * obs_per
     params = (forcing,)
@@ -201,12 +302,35 @@ def run_assimilation(
             x = rk4(lorenz96, 0.0, x, params, dt)
         return x
 
+    n_methods = len(methods)
+    n_alphas = len(alpha_list)
+    n_seeds = len(seed_list)
+    n_time = len(x_true)
+
+    _diag_shape = (n_methods, n_alphas, n_seeds, n_time)
+    _residual_shape = (n_methods, n_alphas, n_seeds)
+
+    _need_compute_diag = diagnostics_path is not None and recompute
+    _force_recompute_xa = _need_compute_diag
+    if diagnostics_path is not None and not _need_compute_diag:
+        print("loaded diagnostics:", diagnostics_path)
+
+    _diag_arrays = None
+    _member_increment_max_abs_unobserved = None
+    if diagnostics_path is not None and _need_compute_diag:
+        _diag_arrays = {k: np.full(_diag_shape, np.nan) for k in DIAG_KEYS}
+        _member_increment_max_abs_unobserved = np.full(_residual_shape, np.nan)
+
+    _method_extra_kwargs = {
+        "po_add": {},
+        "po_proj": {"project_cov": True},
+    }
+
     xa_dict = {}
-    for method_name in methods:
+    for m_idx, method_name in enumerate(methods):
         xa_path = analysis_ensembles_path(data_dir=data_dir, method_name=method_name)
         xa_path.parent.mkdir(parents=True, exist_ok=True)
-        xa = None if recompute else maybe_load_npy(xa_path)
-        if xa is None:
+        if recompute or _force_recompute_xa:
             xa = np.zeros(
                 (len(alpha_list), len(seed_list), len(x_true), ensemble_size, state_dim)
             )
@@ -215,27 +339,15 @@ def run_assimilation(
                 x0_ensemble = initial_ensembles[j]
                 for i, alpha in enumerate(alpha_list):
                     np.random.seed(int(seed))
-                    if method_name == "po_add":
-                        da_instance = PO(
-                            model_step,
-                            h,
-                            observation_cov,
-                            alpha=alpha**2,
-                            store_ensemble=True,
-                            additive_inflation=True,
-                        )
-                    elif method_name == "po_proj":
-                        da_instance = PO(
-                            model_step,
-                            h,
-                            observation_cov,
-                            alpha=alpha**2,
-                            store_ensemble=True,
-                            additive_inflation=True,
-                            project_cov=True,
-                        )
-                    else:
-                        raise ValueError(f"Unknown method: {method_name}")
+                    da_instance = PO(
+                        model_step,
+                        h,
+                        observation_cov,
+                        alpha=alpha**2,
+                        store_ensemble=True,
+                        additive_inflation=True,
+                        **_method_extra_kwargs[method_name],
+                    )
 
                     da_instance.initialize(x0_ensemble.copy())
                     for y_obs in y:
@@ -243,381 +355,594 @@ def run_assimilation(
                         da_instance.update(y_obs)
                     xa[i, j] = da_instance.Xa
 
+                    if _diag_arrays is not None:
+                        _Xf_arr = np.array(da_instance.Xf)
+                        _Xa_arr = np.array(da_instance.Xa)
+                        _diag = compute_diagnostics(_Xf_arr, _Xa_arr, unobserved_idx)
+                        for _k, _v in _diag.items():
+                            _diag_arrays[_k][m_idx, i, j] = _v
+                        _max_abs = float(
+                            np.abs(
+                                _Xa_arr[:, :, unobserved_idx]
+                                - _Xf_arr[:, :, unobserved_idx]
+                            ).max()
+                        )
+                        _member_increment_max_abs_unobserved[m_idx, i, j] = _max_abs
+
             np.save(xa_path, xa)
             print("saved:", xa_path, xa.shape)
+        else:
+            xa = load_npy(xa_path)
 
         xa_dict[method_name] = xa
+
+    if diagnostics_path is not None and _need_compute_diag:
+        diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            diagnostics_path,
+            **_diag_arrays,
+            member_increment_max_abs_unobserved=_member_increment_max_abs_unobserved,
+            method_names=np.array(methods),
+            alphas=np.array(alpha_list),
+            seeds=np.array(seed_list),
+            time_index=np.arange(n_time),
+        )
+        print("saved diagnostics:", diagnostics_path)
 
     return observations, xa_dict
 
 
-def plot_fig1_mse(
-    data_dir,
-    x_true,
-    h,
-    r,
-    alpha_list_all,
-    alpha_list_fig,
-    methods,
-    xa_dict,
-    per_vis=20,
-    num_points=50,
-):
-    """Plot Figure 1: MSE time series."""
-    fig, ax = plt.subplots(figsize=(7, 4))
-    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    time_ticks = np.arange(len(x_true) // per_vis) * per_vis + 1
-    ny = np.linalg.matrix_rank(h)
-    alpha_index_map = {alpha: alpha_list_all.index(alpha) for alpha in alpha_list_fig}
 
-    for k, method_name in enumerate(methods):
-        xa = xa_dict[method_name]
-        color = colors[k % len(colors)]
-        line_cycle = visualize.get_linestyle_cycle()
-        marker_cycle = visualize.get_marker_cycle()
+# ---------------------------------------------------------------------------
+# Experiment configuration – one dict per experiment condition.
+# To add a new condition, define another dict and pass it to run_experiment().
+# ---------------------------------------------------------------------------
 
-        for alpha in alpha_list_fig:
-            alpha_idx = alpha_index_map[alpha]
-            xa_alpha = xa[alpha_idx]
-            ls = next(line_cycle)
-            marker = next(marker_cycle)
+CACHE_SCHEMA_VERSION = 1
 
-            delta_sq = loss_sq(x_true[None, :, None, :] - xa_alpha, 0.0) + loss_sq(
-                x_true[None, :, None, :] @ h.T - xa_alpha @ h.T,
-                0.0,
-            )
-            delta_mean_t, _ = stats(delta_sq)
-            delta_mean = delta_mean_t.mean(axis=1)
-            delta_mean_per_seed = delta_sq.mean(axis=2)
+PAPER_EXPERIMENT = {
+    "state_dim": 60,
+    "forcing": 8.0,
+    "dt": 0.01,
+    "spinup_steps": 20 * 360,
+    "num_steps": 20 * 50,
+    "obs_per": 1,
+    "obs_noise_std": 1.0,
+    "ensemble_size": 10,
+    "seed_list": list(range(20)),
+    "alpha_list_all": [0.0, 0.5, 2.0, 10.0, 100.0],
+    "alpha_list_fig": [0.0, 0.5, 2.0],
+    "methods": ["po_add", "po_proj"],
+    "sample_seed_index": 0,
+    # The manuscript uses k = 1 for sample-path plots; Python indexing is 0-based.
+    "sample_member_index": 0,
+    "observation_pattern": "two_of_three",
+}
 
-            ax.plot(
-                time_ticks[:num_points],
-                delta_mean[::per_vis][:num_points],
-                label=f"{display_method(method_name)} $\\alpha$={alpha}",
-                lw=0.5,
-                ls=ls,
-                color=color,
-                marker=marker,
-                ms=5,
-            )
-            for delta_seed in delta_mean_per_seed:
-                ax.plot(
-                    time_ticks[:num_points],
-                    delta_seed[::per_vis][:num_points],
-                    lw=0.25,
-                    color=color,
-                    alpha=0.3,
-                )
+# ---------------------------------------------------------------------------
+# Projection-comparison experiment constants
+# ---------------------------------------------------------------------------
 
-    ax.plot(
-        time_ticks[:num_points],
-        4 * ny * (r**2) * np.ones_like(time_ticks[:num_points]),
-        label="$ 4 N_y r^2 $",
-        lw=0.5,
-        c="black",
+COMPARISON_SUBDIR = "projection_comparison"
+COMPARISON_M_DIR_FMT = "m{ensemble_size}"
+COMPARISON_DIAGNOSTICS_BASENAME = "diagnostics.npz"
+COMPARISON_SUMMARY_BASENAME = "summary.csv"
+COMPARISON_PDF_BASENAME = "fig5_projection_comparison.pdf"
+COMPARISON_ENSEMBLE_SIZES = (10, 20, 40, 80)
+
+PRODUCTION_METHODS = ("po_add", "po_proj")
+DIAG_KEYS = ("mean_increment_sq_unobserved",)
+
+PROJECTION_COMPARISON_EXPERIMENT = {
+    **PAPER_EXPERIMENT,
+    "observation_pattern": "alternating",
+    "alpha_list_all": [0.5],
+    "alpha_list_fig": [0.5],
+    "seed_list": list(range(20)),
+    "diagnostics_filename": COMPARISON_DIAGNOSTICS_BASENAME,
+    "make_standard_figures": False,
+}
+
+
+def run_experiment(cfg, data_dir, recompute=False, show_sample_paths=False):
+    """Run a single experiment described by cfg and save results to data_dir."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    _marker = _complete_marker_path(data_dir)
+    if recompute:
+        if _marker.exists():
+            _marker.unlink()
+    elif not _marker.exists():
+        recompute = True
+
+    state_dim = cfg["state_dim"]
+    forcing = cfg["forcing"]
+    dt = cfg["dt"]
+    spinup_steps = cfg["spinup_steps"]
+    num_steps = cfg["num_steps"]
+    obs_per = cfg["obs_per"]
+    obs_noise_std = cfg["obs_noise_std"]
+    ensemble_size = cfg["ensemble_size"]
+    seed_list = np.array(cfg["seed_list"])
+    alpha_list_all = cfg["alpha_list_all"]
+    alpha_list_fig = cfg["alpha_list_fig"]
+    methods = cfg["methods"]
+    sample_seed_index = cfg["sample_seed_index"]
+    sample_member_index = cfg["sample_member_index"]
+    observation_pattern = cfg.get("observation_pattern", "two_of_three")
+
+    h = build_observation_operator(state_dim, pattern=observation_pattern)
+    print("H.shape:", h.shape)
+    print("rank(H):", np.linalg.matrix_rank(h))
+
+    parameters = {
+        "state_dim": state_dim,
+        "forcing": forcing,
+        "dt": dt,
+        "spinup_steps": spinup_steps,
+        "num_steps": num_steps,
+        "obs_per": obs_per,
+        "obs_noise_std": obs_noise_std,
+        "ensemble_size": ensemble_size,
+        "seed_list": seed_list.tolist(),
+        "alpha_list_all": alpha_list_all,
+        "alpha_list_fig": alpha_list_fig,
+        "methods": methods,
+        "sample_seed_index": sample_seed_index,
+        "sample_member_index": sample_member_index,
+        "recompute": recompute,
+        "observation_pattern": observation_pattern,
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+    }
+
+    _git_rev = subprocess.run(
+        ["git", "rev-parse", "HEAD"], check=False, capture_output=True, text=True
     )
-    ax.set_xlabel("time step $n$")
-    ax.set_ylabel(r"$ \frac{1}{m} \sum_{k=1}^m \mathbb{E} \|\delta^{(k)}\|^2 $")
-    ax.set_yscale("log")
-    ax.legend(bbox_to_anchor=(1.0, 0.85), loc="upper right", ncol=2)
-    fig.tight_layout()
-    fig.savefig(data_dir / "fig1_mse.pdf", transparent=True)
-    plt.close(fig)
+    if _git_rev.returncode == 0:
+        parameters["git_commit"] = _git_rev.stdout.strip()
+        _git_status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        parameters["git_dirty"] = _git_status.returncode == 0 and bool(
+            _git_status.stdout.strip()
+        )
+    else:
+        parameters["git_commit"] = None
+        parameters["git_dirty"] = None
 
+    if recompute:
+        save_run_parameters(data_dir, parameters)
 
-def plot_fig2_abs_error(
-    data_dir,
-    x_true,
-    alpha_list_all,
-    alpha_list_fig,
-    methods,
-    xa_dict,
-    sample_seed_index,
-    sample_member_index,
-):
-    """Plot Figure 2: spatio-temporal absolute error of one ensemble member."""
-    num_methods = len(methods)
-    num_alphas = len(alpha_list_fig)
-    state_dim = x_true.shape[1]
-
-    global_vmax = 0.0
-    for method_name in methods:
-        xa = xa_dict[method_name]
-        for alpha in alpha_list_fig:
-            alpha_idx = alpha_list_all.index(alpha)
-            x_assim = xa[alpha_idx, sample_seed_index, :, sample_member_index]
-            e_assim = np.abs(x_assim - x_true)
-            global_vmax = max(global_vmax, np.max(e_assim))
-
-    fig, axes = plt.subplots(
-        num_methods,
-        num_alphas,
-        figsize=(8, 8 * num_methods / num_alphas),
-        gridspec_kw={"hspace": 0.1, "wspace": 0.05},
+    x0 = forcing * np.ones(state_dim)
+    x0[19] *= 1.001
+    x_true = generate_true_trajectory(
+        data_dir=data_dir,
+        x0=x0,
+        forcing=forcing,
+        dt=dt,
+        spinup_steps=spinup_steps,
+        num_steps=num_steps,
+        recompute=recompute,
     )
-    if num_methods == 1 and num_alphas == 1:
-        axes = np.array([[axes]])
-    elif num_methods == 1:
-        axes = axes[np.newaxis, :]
-    elif num_alphas == 1:
-        axes = axes[:, np.newaxis]
 
-    im = None
-    for r_idx, method_name in enumerate(methods):
-        xa = xa_dict[method_name]
-        for a_idx, alpha in enumerate(alpha_list_fig):
-            alpha_idx = alpha_list_all.index(alpha)
-            x_assim = xa[alpha_idx, sample_seed_index, :, sample_member_index]
-            e_assim = np.abs(x_assim - x_true)
-
-            ax = axes[r_idx, a_idx]
-            im = ax.imshow(
-                e_assim,
-                aspect=state_dim / len(x_true),
-                vmax=global_vmax,
-                vmin=0.0,
-                origin="lower",
-                interpolation="none",
-                cmap="flare_r",
-            )
-            if r_idx == 0:
-                ax.set_title(f"$\\alpha$={alpha}")
-                ax.set_xticks([])
-            elif r_idx == num_methods - 1:
-                ax.set_xlabel("space $i$")
-            if a_idx == 0:
-                ax.set_ylabel(display_method(method_name) + "\n" + "time $n$")
-            else:
-                ax.set_yticks([])
-
-    if im is not None:
-        fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.046, pad=0.04)
-    fig.savefig(data_dir / "fig2_abs_error.pdf", transparent=True)
-    plt.close(fig)
-
-
-def plot_fig3_covariance(
-    data_dir,
-    h,
-    alpha_list_all,
-    methods,
-    xa_dict,
-    sample_seed_index,
-):
-    """Plot Figure 3: normalized and rearranged covariance matrices."""
-    num_methods = len(methods)
-    num_alphas = len(alpha_list_all)
-    observed_idx = np.where(np.diag(h.T @ h) > 0.5)[0]
     unobserved_idx = np.where(np.diag(h.T @ h) <= 0.5)[0]
-    sort_idx = np.concatenate([observed_idx, unobserved_idx])
-    vmax = 1.0
-    vmin = -1.0
-
-    fig, axes = plt.subplots(
-        num_methods,
-        num_alphas,
-        figsize=(8, 8 * num_methods / num_alphas),
-        gridspec_kw={"hspace": 0.1, "wspace": 0.05},
+    diagnostics_filename = cfg.get("diagnostics_filename")
+    diagnostics_path = (
+        (data_dir / diagnostics_filename) if diagnostics_filename else None
     )
-    if num_methods == 1 and num_alphas == 1:
-        axes = np.array([[axes]])
-    elif num_methods == 1:
-        axes = axes[np.newaxis, :]
-    elif num_alphas == 1:
-        axes = axes[:, np.newaxis]
 
-    im = axes.ravel()[0].imshow(
-        np.zeros((1, 1)), cmap="coolwarm", vmax=vmax, vmin=vmin, interpolation="none"
+    _make_standard_figures = cfg.get("make_standard_figures", True)
+    observations, xa_dict = run_assimilation(
+        data_dir=data_dir,
+        x_true=x_true,
+        h=h,
+        forcing=forcing,
+        r=obs_noise_std,
+        dt=dt,
+        obs_per=obs_per,
+        ensemble_size=ensemble_size,
+        alpha_list=alpha_list_all,
+        methods=methods,
+        seed_list=seed_list,
+        recompute=recompute,
+        diagnostics_path=diagnostics_path,
+        unobserved_idx=unobserved_idx if diagnostics_path is not None else None,
+        load_analysis_ensembles=_make_standard_figures,
     )
-    for r_idx, method_name in enumerate(methods):
-        xa = xa_dict[method_name]
-        for c_idx, alpha in enumerate(alpha_list_all):
-            xa_sample = xa[c_idx, sample_seed_index]
-            d_x = xa_sample - xa_sample.mean(axis=1, keepdims=True)
-            p = (d_x.swapaxes(-2, -1) @ d_x) / (xa_sample.shape[1] - 1)
-            p_last = p[-1]
-            scale = np.abs(p_last).max()
-            if scale > 0.0:
-                p_last = p_last / scale
-            p_rearranged = p_last[sort_idx][:, sort_idx]
 
-            ax = axes[r_idx, c_idx]
-            im = ax.imshow(
-                p_rearranged,
-                cmap="coolwarm",
-                interpolation="none",
-                vmax=vmax,
-                vmin=vmin,
+    if _make_standard_figures:
+        write_fig1_summary_csv(
+            data_dir=data_dir,
+            x_true=x_true,
+            h=h,
+            r=obs_noise_std,
+            alpha_list_all=alpha_list_all,
+            alpha_list_fig=alpha_list_fig,
+            methods=methods,
+            xa_dict=xa_dict,
+        )
+        plot_fig1_mse(
+            data_dir=data_dir,
+            x_true=x_true,
+            h=h,
+            r=obs_noise_std,
+            alpha_list_all=alpha_list_all,
+            alpha_list_fig=alpha_list_fig,
+            methods=methods,
+            xa_dict=xa_dict,
+            show_sample_paths=show_sample_paths,
+        )
+        plot_fig2_abs_error(
+            data_dir=data_dir,
+            x_true=x_true,
+            alpha_list_all=alpha_list_all,
+            alpha_list_fig=alpha_list_fig,
+            methods=methods,
+            xa_dict=xa_dict,
+            sample_seed_index=sample_seed_index,
+            sample_member_index=sample_member_index,
+        )
+        plot_fig3_covariance(
+            data_dir=data_dir,
+            h=h,
+            alpha_list_all=alpha_list_all,
+            methods=methods,
+            xa_dict=xa_dict,
+            sample_seed_index=sample_seed_index,
+        )
+        plot_fig4_offdiag_ratio(
+            data_dir=data_dir,
+            h=h,
+            alpha_list_all=alpha_list_all,
+            methods=methods,
+            xa_dict=xa_dict,
+            show_sample_paths=show_sample_paths,
+        )
+        plot_fig6_true_obs(
+            data_dir=data_dir,
+            x_true=x_true,
+            h=h,
+            observations=observations,
+            sample_seed_index=sample_seed_index,
+        )
+        plot_fig7_analysis_states(
+            data_dir=data_dir,
+            x_true=x_true,
+            alpha_list_all=alpha_list_all,
+            alpha_list_fig=alpha_list_fig,
+            methods=methods,
+            xa_dict=xa_dict,
+            sample_seed_index=sample_seed_index,
+            sample_member_index=sample_member_index,
+        )
+
+    # Atomic marker write: all computation and figures succeeded
+    _tmp = data_dir / ".complete.tmp"
+    _tmp.write_text("complete\n", encoding="utf-8")
+    _tmp.replace(_marker)
+
+
+def _load_weighted_error_timeseries(m_dir, method, alpha_idx=0):
+    """Return seed-wise member-mean weighted-error time series.
+
+    The manuscript norm is expanded computationally as the full-state squared
+    error plus the observed-component squared error.  The returned array has
+    shape ``(n_seeds, n_time)``.
+    """
+    x_true = np.load(true_trajectory_path(m_dir), mmap_mode="r")
+    xa = np.load(analysis_ensembles_path(m_dir, method), mmap_mode="r")
+    with (m_dir / "run_parameters.json").open(encoding="utf-8") as f:
+        run_params = json.load(f)
+    h = build_observation_operator(
+        run_params["state_dim"],
+        pattern=run_params.get("observation_pattern", "alternating"),
+    )
+    return weighted_error_per_seed(x_true, h, xa[alpha_idx])
+
+
+def _aggregate_diagnostics_one_m(npz_path):
+    """Return the two final per-seed scalar diagnostics for one ensemble size."""
+    alpha_idx = 0
+    m_dir = Path(npz_path).parent
+
+    with np.load(npz_path) as npz:
+        seeds = npz["seeds"]
+        result = {"seeds": seeds}
+        for m_idx, method in enumerate(PRODUCTION_METHODS):
+            miu = npz["mean_increment_sq_unobserved"][m_idx, alpha_idx]
+            result[method] = {
+                "mean_increment_rms_unobserved": np.sqrt(
+                    time_average_per_seed_all(miu)
+                ),
+            }
+
+    for method in PRODUCTION_METHODS:
+        weighted_timeseries = _load_weighted_error_timeseries(m_dir, method, alpha_idx)
+        result[method]["weighted_norm_error"] = time_average_per_seed_all(
+            weighted_timeseries
+        )
+
+    return result
+
+
+def _write_summary_csv(csv_path, result_groups, methods):
+    """Write long-form summary CSV to csv_path.
+
+    Aggregate rows report the arithmetic seed mean and the empirical 2.5th and
+    97.5th seed percentiles. Per-seed rows leave the percentile columns empty.
+    """
+    _FIELDS = [
+        "record_type",
+        "ensemble_size",
+        "alpha",
+        "seed",
+        "method",
+        "metric",
+        "estimate",
+        "p2_5",
+        "p97_5",
+    ]
+
+    def _fmt(v):
+        return repr(float(v))
+
+    rows = []
+    for group in result_groups:
+        alpha = group["alpha"]
+        metrics = group["metrics"]
+        for m, m_res in zip(group["ensemble_sizes"], group["results"]):
+            seeds = m_res["seeds"]
+            for metric in metrics:
+                for method in methods:
+                    vals = m_res[method][metric]
+                    for seed_val, value in zip(seeds, vals):
+                        rows.append(
+                            {
+                                "record_type": "per_seed",
+                                "ensemble_size": m,
+                                "alpha": alpha,
+                                "seed": int(seed_val),
+                                "method": method,
+                                "metric": metric,
+                                "estimate": _fmt(value),
+                                "p2_5": "",
+                                "p97_5": "",
+                            }
+                        )
+                    mean, p2_5, p97_5 = mean_empirical_percentile_band(vals)
+                    rows.append(
+                        {
+                            "record_type": "aggregate",
+                            "ensemble_size": m,
+                            "alpha": alpha,
+                            "seed": "",
+                            "method": method,
+                            "metric": metric,
+                            "estimate": _fmt(mean),
+                            "p2_5": _fmt(p2_5),
+                            "p97_5": _fmt(p97_5),
+                        }
+                    )
+
+            ratios = (
+                m_res["po_add"]["weighted_norm_error"]
+                / m_res["po_proj"]["weighted_norm_error"]
             )
-            if r_idx == 0:
-                ax.set_title(f"$\\alpha$={alpha}")
-            if c_idx == 0:
-                ax.set_ylabel(display_method(method_name) + "\n" + "i")
-            if r_idx == num_methods - 1:
-                ax.set_xlabel("j")
-            ax.set_xticks([])
-            ax.set_yticks([])
+            for seed_val, ratio in zip(seeds, ratios):
+                rows.append(
+                    {
+                        "record_type": "per_seed",
+                        "ensemble_size": m,
+                        "alpha": alpha,
+                        "seed": int(seed_val),
+                        "method": "po_add/po_proj",
+                        "metric": "weighted_norm_error_ratio",
+                        "estimate": _fmt(ratio),
+                        "p2_5": "",
+                        "p97_5": "",
+                    }
+                )
+            mean, p2_5, p97_5 = mean_empirical_percentile_band(ratios)
+            rows.append(
+                {
+                    "record_type": "aggregate",
+                    "ensemble_size": m,
+                    "alpha": alpha,
+                    "seed": "",
+                    "method": "po_add/po_proj",
+                    "metric": "weighted_norm_error_ratio",
+                    "estimate": _fmt(mean),
+                    "p2_5": _fmt(p2_5),
+                    "p97_5": _fmt(p97_5),
+                }
+            )
 
-    fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.046, pad=0.04)
-    fig.savefig(data_dir / "fig3_covariance.pdf", transparent=True)
-    plt.close(fig)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print("saved:", csv_path)
 
 
-def plot_fig4_offdiag_ratio(
+def write_fig5_summary_csv(data_dir, ensemble_sizes, all_results, alpha, num_steps):
+    """Write table-ready statistics corresponding to Figure 5.
+
+    One row per ensemble size, holding the two quantities shown in the figure:
+    the direct unobserved analysis-increment RMS for ``add`` (panel (a)) and the
+    per-seed paired ``add``/``add-proj`` weighted-error ratio (panel (b)). Both
+    are already time-averaged over all analysis times by
+    ``_aggregate_diagnostics_one_m``. The reported values are the arithmetic
+    seed mean and the empirical 2.5th--97.5th percentiles.
+
+    The ``add-proj`` increment is identically zero by construction and is
+    therefore stated in the manuscript caption rather than given a column.
+    """
+    rows = []
+    for m, m_res in zip(ensemble_sizes, all_results):
+        increments = m_res["po_add"]["mean_increment_rms_unobserved"]
+        ratios = (
+            m_res["po_add"]["weighted_norm_error"]
+            / m_res["po_proj"]["weighted_norm_error"]
+        )
+        inc_mean, inc_low, inc_high = mean_empirical_percentile_band(increments)
+        ratio_mean, ratio_low, ratio_high = mean_empirical_percentile_band(ratios)
+        rows.append(
+            {
+                "ensemble_size": m,
+                "alpha": alpha,
+                "increment_rms": inc_mean,
+                "increment_rms_p2_5": inc_low,
+                "increment_rms_p97_5": inc_high,
+                "mse_ratio": ratio_mean,
+                "mse_ratio_p2_5": ratio_low,
+                "mse_ratio_p97_5": ratio_high,
+                "num_seeds": len(m_res["seeds"]),
+                "analysis_time_start": 1,
+                "analysis_time_end": num_steps,
+            }
+        )
+
+    path = Path(data_dir) / FIG5_SUMMARY_BASENAME
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    print("saved:", path)
+
+
+def run_projection_comparison(
     data_dir,
-    h,
-    alpha_list_all,
-    methods,
-    xa_dict,
-    sample_seed_index,
-    per_vis=20,
-    num_points=50,
+    recompute=False,
+    cfg=None,
+    ensemble_sizes=None,
 ):
-    """Plot Figure 4: off-diagonal/observed covariance ratio."""
-    fig, ax = plt.subplots(figsize=(7, 4))
-    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    time_ticks = np.arange(next(iter(xa_dict.values())).shape[2] // per_vis) * per_vis + 1
-    pi = h.T @ h
-    q = np.eye(pi.shape[0]) - pi
+    """Run and aggregate the projection-comparison experiment behind Figure 5."""
+    if cfg is None:
+        cfg = PROJECTION_COMPARISON_EXPERIMENT
+    if ensemble_sizes is None:
+        ensemble_sizes = COMPARISON_ENSEMBLE_SIZES
+    data_dir = Path(data_dir)
+    ensemble_sizes = tuple(ensemble_sizes)
+    base_dir = data_dir / COMPARISON_SUBDIR
+    methods = cfg["methods"]
 
-    for k, method_name in enumerate(methods):
-        xa = xa_dict[method_name]
-        color = colors[k % len(colors)]
-        line_cycle = visualize.get_linestyle_cycle()
-        marker_cycle = visualize.get_marker_cycle()
+    for m in ensemble_sizes:
+        m_cfg = {**cfg, "ensemble_size": m}
+        m_dir = base_dir / COMPARISON_M_DIR_FMT.format(ensemble_size=m)
+        run_experiment(m_cfg, m_dir, recompute=recompute)
 
-        for i, alpha in enumerate(alpha_list_all):
-            xa_sample = xa[i, sample_seed_index]
-            d_x = xa_sample - xa_sample.mean(axis=1, keepdims=True)
-            p = (d_x.swapaxes(-2, -1) @ d_x) / (xa_sample.shape[1] - 1)
-            num = np.linalg.norm(q @ p @ pi.T, axis=(1, 2))
-            den = np.linalg.norm(pi @ p @ pi.T, axis=(1, 2))
-            ratio = np.divide(
-                num,
-                den,
-                out=np.full_like(num, np.nan),
-                where=den > 0.0,
-            )
+    all_results = []
+    for m in ensemble_sizes:
+        m_dir = base_dir / COMPARISON_M_DIR_FMT.format(ensemble_size=m)
+        npz_path = m_dir / COMPARISON_DIAGNOSTICS_BASENAME
+        all_results.append(_aggregate_diagnostics_one_m(npz_path))
 
-            ax.plot(
-                time_ticks[:num_points],
-                ratio[::per_vis][:num_points],
-                label=f"{display_method(method_name)} $\\alpha$={alpha}",
-                lw=0.5,
-                ls=next(line_cycle),
-                color=color,
-                marker=next(marker_cycle),
-                ms=5,
-            )
-
-    ax.set_ylabel(r"$\left|(I-\Pi)P_n\Pi\right|_F / \left|\Pi P_n \Pi\right|_F$")
-    ax.set_xlabel("time step $n$")
-    ax.set_ylim((0.0, 2.0))
-    ax.legend(bbox_to_anchor=(1.0, 1.0), loc="upper right", ncol=2)
-    fig.tight_layout()
-    fig.savefig(data_dir / "fig4_offdiag_ratio.pdf", transparent=True)
-    plt.close(fig)
-
-
-def plot_fig5_true_obs(data_dir, x_true, h, observations, sample_seed_index):
-    """Plot Figure 5: true state and observations."""
-    state_dim = x_true.shape[1]
-    y = observations[sample_seed_index]
-    y_extended = (h.T @ y.T).T
-    y_mask = np.ma.masked_where(y_extended == 0.0, y_extended)
-    vmax = np.max(x_true)
-    vmin = np.min(x_true)
-
-    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-    im = axes[0].imshow(
-        x_true,
-        aspect=state_dim / len(x_true),
-        vmax=vmax,
-        vmin=vmin,
-        origin="lower",
-        interpolation="none",
+    csv_path = base_dir / COMPARISON_SUMMARY_BASENAME
+    _write_summary_csv(
+        csv_path,
+        [
+            {
+                "alpha": cfg["alpha_list_all"][0],
+                "ensemble_sizes": ensemble_sizes,
+                "results": all_results,
+                "metrics": (
+                    "mean_increment_rms_unobserved",
+                    "weighted_norm_error",
+                ),
+            },
+        ],
+        methods,
     )
-    axes[0].set_ylabel("time $n$")
-    axes[0].set_xlabel("space $i$")
-    axes[0].set_title("true state")
 
-    axes[1].imshow(
-        y_mask,
-        aspect=state_dim / len(x_true),
-        vmax=vmax,
-        vmin=vmin,
-        origin="lower",
-        interpolation="none",
+    write_fig5_summary_csv(
+        data_dir,
+        ensemble_sizes,
+        all_results,
+        alpha=cfg["alpha_list_all"][0],
+        num_steps=cfg["num_steps"],
     )
-    axes[1].set_xlabel("space $i$")
-    axes[1].set_title("observation")
-    axes[1].set_yticks([])
 
-    cax = fig.add_axes((0.92, 0.155, 0.03, 0.675))
-    fig.colorbar(im, cax=cax)
-    fig.savefig(data_dir / "fig5_true_obs.pdf", transparent=True)
-    plt.close(fig)
+    plot_fig5_projection_comparison(
+        data_dir / COMPARISON_PDF_BASENAME,
+        ensemble_sizes,
+        all_results,
+        methods,
+    )
 
 
-def plot_fig6_analysis_states(
+def run_reproduction(
     data_dir,
-    x_true,
-    alpha_list_all,
-    alpha_list_fig,
-    methods,
-    xa_dict,
-    sample_seed_index,
-    sample_member_index,
+    *,
+    num_steps=PAPER_EXPERIMENT["num_steps"],
+    spinup_steps=PAPER_EXPERIMENT["spinup_steps"],
+    seed_list=None,
+    baseline_alpha=None,
+    comparison_sizes=COMPARISON_ENSEMBLE_SIZES,
+    recompute=False,
+    show_sample_paths=False,
 ):
-    """Plot Figure 6: sample-path analysis states."""
-    num_methods = len(methods)
-    num_alphas = len(alpha_list_fig)
-    state_dim = x_true.shape[1]
-    vmax = np.max(x_true)
-    vmin = np.min(x_true)
+    """Internal entry point for reproducibility and smoke testing.
 
-    fig, axes = plt.subplots(
-        num_methods,
-        num_alphas,
-        figsize=(8, 8 * num_methods / num_alphas),
-        gridspec_kw={"hspace": 0.1, "wspace": 0.05},
+    Defaults reproduce the full paper experiments.  For a quick smoke test pass
+    smaller values explicitly:
+
+        run_reproduction(
+            data_dir,
+            num_steps=20, spinup_steps=7200, seed_list=(0, 1),
+            baseline_alpha=(0.5,), comparison_sizes=(10, 20),
+        )
+
+    Parameters
+    ----------
+    data_dir : path-like
+    num_steps : int
+    spinup_steps : int
+    seed_list : sequence of int or None
+        Seeds shared by baseline and comparison. Defaults to all paper seeds.
+    baseline_alpha : sequence of float or None
+        Inflation parameters for the baseline experiment. Defaults to all paper alphas.
+    comparison_sizes : sequence of int
+        Ensemble sizes for the projection-comparison experiment.
+    recompute : bool
+    """
+    if seed_list is None:
+        seed_list = PAPER_EXPERIMENT["seed_list"]
+    if baseline_alpha is None:
+        _alpha_list_all = PAPER_EXPERIMENT["alpha_list_all"]
+        _alpha_list_fig = PAPER_EXPERIMENT["alpha_list_fig"]
+    else:
+        _alpha_list_all = list(baseline_alpha)
+        _alpha_list_fig = list(baseline_alpha)
+    data_dir = Path(data_dir)
+    baseline_cfg = {
+        **PAPER_EXPERIMENT,
+        "num_steps": num_steps,
+        "spinup_steps": spinup_steps,
+        "alpha_list_all": _alpha_list_all,
+        "alpha_list_fig": _alpha_list_fig,
+        "seed_list": list(seed_list),
+    }
+    run_experiment(
+        baseline_cfg,
+        data_dir,
+        recompute=recompute,
+        show_sample_paths=show_sample_paths,
     )
-    if num_methods == 1 and num_alphas == 1:
-        axes = np.array([[axes]])
-    elif num_methods == 1:
-        axes = axes[np.newaxis, :]
-    elif num_alphas == 1:
-        axes = axes[:, np.newaxis]
-
-    im = None
-    for r_idx, method_name in enumerate(methods):
-        xa = xa_dict[method_name]
-        for a_idx, alpha in enumerate(alpha_list_fig):
-            alpha_idx = alpha_list_all.index(alpha)
-            x_assim = xa[alpha_idx, sample_seed_index, :, sample_member_index]
-            ax = axes[r_idx, a_idx]
-            im = ax.imshow(
-                x_assim,
-                aspect=state_dim / len(x_true),
-                vmax=vmax,
-                vmin=vmin,
-                origin="lower",
-                interpolation="none",
-            )
-            if r_idx == 0:
-                ax.set_title(f"$\\alpha$={alpha}")
-                ax.set_xticks([])
-            elif r_idx == num_methods - 1:
-                ax.set_xlabel("space $i$")
-            if a_idx == 0:
-                ax.set_ylabel(display_method(method_name) + "\n" + "time $n$")
-            else:
-                ax.set_yticks([])
-
-    if im is not None:
-        fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.046, pad=0.04)
-    fig.savefig(data_dir / "fig6_analysis_states.pdf", transparent=True)
-    plt.close(fig)
+    comparison_cfg = {
+        **PROJECTION_COMPARISON_EXPERIMENT,
+        "num_steps": num_steps,
+        "spinup_steps": spinup_steps,
+        "seed_list": list(seed_list),
+    }
+    run_projection_comparison(
+        data_dir,
+        recompute=recompute,
+        cfg=comparison_cfg,
+        ensemble_sizes=tuple(comparison_sizes),
+    )
 
 
 def parse_args():
@@ -635,136 +960,20 @@ def parse_args():
         action="store_true",
         help="Regenerate cached arrays even if they already exist.",
     )
+    parser.add_argument(
+        "--show-sample-paths",
+        action="store_true",
+        help="Overlay seed-wise paths on the time-series figures.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    data_dir = Path(args.data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    state_dim = 60
-    forcing = 8.0
-    dt = 0.01
-    spinup_steps = 20 * 360
-    num_steps = 20 * 50
-
-    obs_per = 1
-    obs_noise_std = 1.0
-
-    ensemble_size = 10
-    seed_list = np.arange(20)
-    alpha_list_all = [0.0, 0.5, 2.0, 10.0, 100.0]
-    alpha_list_fig = [0.0, 0.5, 2.0]
-    methods = ["po_add", "po_proj"]
-
-    sample_seed_index = 0
-    sample_member_index = 0
-    # The manuscript uses k = 1 for the sample-path plots; Python indexing is 0-based.
-
-    save_run_parameters(
-        data_dir=data_dir,
-        parameters={
-            "state_dim": state_dim,
-            "forcing": forcing,
-            "dt": dt,
-            "spinup_steps": spinup_steps,
-            "num_steps": num_steps,
-            "obs_per": obs_per,
-            "obs_noise_std": obs_noise_std,
-            "ensemble_size": ensemble_size,
-            "seed_list": seed_list.tolist(),
-            "alpha_list_all": alpha_list_all,
-            "alpha_list_fig": alpha_list_fig,
-            "methods": methods,
-            "sample_seed_index": sample_seed_index,
-            "sample_member_index": sample_member_index,
-            "recompute": args.recompute,
-        },
-    )
-
-    x0 = forcing * np.ones(state_dim)
-    x0[19] *= 1.001
-    x_true = generate_true_trajectory(
-        data_dir=data_dir,
-        x0=x0,
-        forcing=forcing,
-        dt=dt,
-        spinup_steps=spinup_steps,
-        num_steps=num_steps,
-    )
-
-    h = build_observation_operator(state_dim)
-    print("H.shape:", h.shape)
-    print("rank(H):", np.linalg.matrix_rank(h))
-
-    observations, xa_dict = run_assimilation(
-        data_dir=data_dir,
-        x_true=x_true,
-        h=h,
-        forcing=forcing,
-        r=obs_noise_std,
-        dt=dt,
-        obs_per=obs_per,
-        ensemble_size=ensemble_size,
-        alpha_list=alpha_list_all,
-        methods=methods,
-        seed_list=seed_list,
+    run_reproduction(
+        args.data_dir,
         recompute=args.recompute,
-    )
-
-    plot_fig1_mse(
-        data_dir=data_dir,
-        x_true=x_true,
-        h=h,
-        r=obs_noise_std,
-        alpha_list_all=alpha_list_all,
-        alpha_list_fig=alpha_list_fig,
-        methods=methods,
-        xa_dict=xa_dict,
-    )
-    plot_fig2_abs_error(
-        data_dir=data_dir,
-        x_true=x_true,
-        alpha_list_all=alpha_list_all,
-        alpha_list_fig=alpha_list_fig,
-        methods=methods,
-        xa_dict=xa_dict,
-        sample_seed_index=sample_seed_index,
-        sample_member_index=sample_member_index,
-    )
-    plot_fig3_covariance(
-        data_dir=data_dir,
-        h=h,
-        alpha_list_all=alpha_list_all,
-        methods=methods,
-        xa_dict=xa_dict,
-        sample_seed_index=sample_seed_index,
-    )
-    plot_fig4_offdiag_ratio(
-        data_dir=data_dir,
-        h=h,
-        alpha_list_all=alpha_list_all,
-        methods=methods,
-        xa_dict=xa_dict,
-        sample_seed_index=sample_seed_index,
-    )
-    plot_fig5_true_obs(
-        data_dir=data_dir,
-        x_true=x_true,
-        h=h,
-        observations=observations,
-        sample_seed_index=sample_seed_index,
-    )
-    plot_fig6_analysis_states(
-        data_dir=data_dir,
-        x_true=x_true,
-        alpha_list_all=alpha_list_all,
-        alpha_list_fig=alpha_list_fig,
-        methods=methods,
-        xa_dict=xa_dict,
-        sample_seed_index=sample_seed_index,
-        sample_member_index=sample_member_index,
+        show_sample_paths=args.show_sample_paths,
     )
 
 

@@ -163,3 +163,5 @@ cython_debug/
 
 # Python
 .python-version
+# Linter cache
+.ruff_cache/
